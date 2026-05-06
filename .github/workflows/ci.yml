@@ -24,16 +24,20 @@ jobs:
       - name: Install build tools
         run: sudo apt-get install -y ninja-build
 
-      # Download setup_mlir.py from upstream ktir-mlir-frontend and resolve MLIR_DIR.
+      # Derive MLIR_DIR using the ktir-mlir-frontend commit pinned in pyproject.toml,
+      # so setup_mlir.py and llvm-hash.txt come from the same ref uv.lock installs —
+      # the source + LLVM pair that upstream CI actually validated together.
       # We pass --wheel to use the mlir_wheel fallback (artifact path requires a GitHub
-      # token not available in public CI). --hash pins to the LLVM build tested upstream.
+      # token not available in public CI).
       # Drop-in removal: once ktir-mlir-frontend publishes a wheel to PyPI, delete
       # this step entirely — `uv sync --extra mlir-frontend` will install it directly.
       - name: Set up MLIR
         run: |
-          SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/scripts/setup_mlir.py"
-          LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/cmake/llvm-hash.txt")
-          MLIR_DIR=$(curl -fsSL "$SETUP_MLIR" | uv run python - --wheel --hash "$LLVM_HASH")
+          REF=$(grep -oE 'ktir-mlir-frontend@[^"]+' pyproject.toml | cut -d@ -f2)
+          [ -n "$REF" ] || { echo "could not extract ktir-mlir-frontend ref from pyproject.toml" >&2; exit 1; }
+          BASE="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$REF"
+          LLVM_HASH=$(curl -fsSL "$BASE/cmake/llvm-hash.txt")
+          MLIR_DIR=$(curl -fsSL "$BASE/scripts/setup_mlir.py" | uv run python - --wheel --hash "$LLVM_HASH")
           uv pip install scikit-build-core "nanobind>=2.12.0"
           echo "CMAKE_ARGS=-DMLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
 

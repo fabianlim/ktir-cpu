@@ -29,8 +29,12 @@ dev = [
     "pytest-cov>=4.0",
 ]
 # No PyPI release yet; built from source via setup_mlir.py (see CONTRIBUTING.md).
+# The @<sha> pin is the single source of truth for this dependency: uv.lock resolves
+# against it, and CI + README derive setup_mlir.py / llvm-hash.txt from the same ref
+# so the LLVM toolchain matches what upstream CI validated this commit against.
+# To upgrade: change the sha here, run `uv lock`, commit both files.
 mlir-frontend = [
-    "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend",
+    "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend@c2412cddc2a247ff1700fd594d0dd9011d675404",
 ]
 
 [tool.setuptools_scm]

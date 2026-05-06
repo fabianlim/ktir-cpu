@@ -31,10 +31,13 @@ Until a PyPI release is available, build from source:
 Resolve `MLIR_DIR` using one of:
 
 ```bash
-# Option 1: pin to the LLVM hash tested by ktir-mlir-frontend
-SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/scripts/setup_mlir.py"
-LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/cmake/llvm-hash.txt")
-MLIR_DIR=$(curl -fsSL "$SETUP_MLIR" | uv run python - --wheel --hash "$LLVM_HASH")
+# Option 1: reproducible — fetch setup_mlir.py and llvm-hash.txt from the exact
+# ktir-mlir-frontend commit pinned in pyproject.toml, so the LLVM toolchain matches
+# the one upstream CI validated this commit against.
+REF=$(grep -oE 'ktir-mlir-frontend@[^"]+' pyproject.toml | cut -d@ -f2)
+BASE="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$REF"
+LLVM_HASH=$(curl -fsSL "$BASE/cmake/llvm-hash.txt")
+MLIR_DIR=$(curl -fsSL "$BASE/scripts/setup_mlir.py" | uv run python - --wheel --hash "$LLVM_HASH")
 
 # Option 2: use the latest mlir_wheel (simplest, no pinned hash)
 uv pip install mlir_wheel --find-links https://llvm.github.io/eudsl
