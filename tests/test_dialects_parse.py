@@ -525,7 +525,6 @@ class TestKtdpParsers(ParseTestMixin):
     def test_affine_set_with_symbolic_dim(self):
         # affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)> uses a symbolic
         # dimension s0 whose value is only known at runtime (the tensor size).
-        # The current parser raises ValueError on the unknown token 's0'.
         op = self._parse(
             "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
             " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
@@ -535,8 +534,7 @@ class TestKtdpParsers(ParseTestMixin):
         self.assert_op_type(op, "ktdp.construct_memory_view")
         self.assert_attribute(op, "dtype", "f32")
         self.assert_attribute(op, "memory_space", "HBM")
-        # shape should be dynamic (None or -1 convention TBD)
-        # operands must include both %ptr and %n_idx
+        # dynamic dim stored as the SSA name string "%n_idx" in the shape tuple
         self.assert_num_operands(op, 2)
 
     def test_construct_memory_view_dynamic_memref_type(self):

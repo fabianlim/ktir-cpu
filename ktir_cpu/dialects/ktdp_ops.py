@@ -202,15 +202,20 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         raise ValueError(
             f"construct_memory_view: memref<{memref_match.group(1)}> has no dimensions"
         )
+    # '?' in the memref type means the dimension is dynamic (value only known at
+    # runtime).  We keep it as None until we can substitute the SSA size below.
     memref_dims = [None if p == "?" else int(p) for p in parts[:-1]]
     # Build shape: prefer SSA size tokens for dynamic dims, fall back to memref_dims.
-    # SSA size strings are resolved at runtime by the executor via context.get_value().
+    # An SSA name (e.g. "%n_idx") is kept as a string in the shape tuple; the
+    # executor resolves it via context.get_value() at runtime.  The result_type
+    # round-trips the string back to '?' so downstream MLIR consumers see a valid
+    # dynamic memref type.
     if sizes is not None:
         resolved = []
         for i, s in enumerate(sizes):
             mem_d = memref_dims[i] if i < len(memref_dims) else None
             if isinstance(s, str):
-                resolved.append(s)  # SSA name — runtime value
+                resolved.append(s)  # SSA name — resolved at runtime
             elif s is not None and mem_d is not None and s != mem_d:
                 raise ValueError(
                     f"construct_memory_view: sizes[{i}]={s} does not match "
@@ -240,7 +245,7 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         op_type="ktdp.construct_memory_view",
         operands=[ptr_operand] + ssa_size_operands + ssa_stride_operands,
         attributes=attributes,
-        result_type=f"memref<{'x'.join('?' if (s is None or isinstance(s, str)) else str(s) for s in shape)}x{dtype}>"
+        result_type=f"memref<{'x'.join(str(s) if isinstance(s, int) else '?' for s in shape)}x{dtype}>"
     )
 
 
