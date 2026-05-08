@@ -566,6 +566,79 @@ class TestKtdpParsers(ParseTestMixin):
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%ptr", "%n_idx")
 
+    def test_construct_memory_view_multi_dim_mixed_static_dynamic(self):
+        # Multi-dim memref with one static and one dynamic dimension.
+        # sizes: [1024, %n] — first dim matches the concrete memref dim,
+        # second dim is an SSA name for the '?' dim.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [1024, %n], strides: [%n, 1]"
+            " { coordinate_set = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + 1023 >= 0,"
+            " d1 >= 0, -d1 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024x?xf16>",
+            args={"%ptr": "index", "%n": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "dtype", "f16")
+        # Only assert the concrete dim — the dynamic dim is represented as the
+        # SSA name string "%n" by the regex parser, and as the ShapedType
+        # sentinel by the MLIR frontend.
+        shape = op.attributes["shape"]
+        assert shape[0] == 1024
+        assert len(shape) == 2
+
+    @pytest.mark.regex_only
+    def test_construct_memory_view_sizes_count_mismatch_rejected(self):
+        # sizes: has 2 entries but memref<1024xf16> has only 1 dimension.
+        with pytest.raises(ValueError, match=r"sizes count.*does not match|mismatch"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, sizes: [1024, 32], strides: [1]"
+                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+                args={"%ptr": "index"},
+            )
+
+    @pytest.mark.regex_only
+    def test_construct_memory_view_static_dim_mismatch_rejected(self):
+        # sizes: [512] disagrees with the concrete memref dim 1024.
+        with pytest.raises(ValueError, match=r"sizes\[0\]=512 does not match memref dimension 1024"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, sizes: [512], strides: [1]"
+                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+                args={"%ptr": "index"},
+            )
+
+    @pytest.mark.regex_only
+    @pytest.mark.parametrize("sizes_str,memref_type,strides_str,args", [
+        # 1-D: single dynamic dim given a concrete literal
+        ("[512]",      "memref<?xf16>",       "[1]",    {"%ptr": "index"}),
+        # 2-D: first dim dynamic, second static — literal given for the '?' dim
+        ("[512, 32]",  "memref<?x32xf16>",    "[32, 1]", {"%ptr": "index"}),
+        # 2-D: second dim dynamic, first static — literal given for the '?' dim
+        ("[1024, 32]", "memref<1024x?xf16>",  "[32, 1]", {"%ptr": "index"}),
+        # 2-D: both dims dynamic — literals given for both '?' dims
+        ("[512, 32]",  "memref<?x?xf16>",     "[32, 1]", {"%ptr": "index"}),
+    ])
+    def test_construct_memory_view_dynamic_dim_with_concrete_size_rejected(
+        self, sizes_str, memref_type, strides_str, args
+    ):
+        # A '?' dim must be given an SSA name in sizes:, not a concrete literal.
+        with pytest.raises(ValueError, match=r"dynamic dim.*requires.*SSA|'\\?' dim.*must be.*SSA"):
+            self._parse(
+                f"%view = ktdp.construct_memory_view %ptr, sizes: {sizes_str},"
+                f" strides: {strides_str}"
+                f" {{ memory_space = #ktdp.spyre_memory_space<HBM> }} : {memref_type}",
+                args=args,
+            )
+
+    @pytest.mark.regex_only
+    def test_construct_memory_view_dynamic_dim_no_sizes_rejected(self):
+        # No sizes: attribute at all, but memref has a '?' dim — unresolvable at parse time.
+        with pytest.raises(ValueError, match=r"dynamic dim|'\\?' dim|no sizes"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, strides: [1]"
+                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf16>",
+                args={"%ptr": "index"},
+            )
+
     def test_construct_access_tile_dynamic_memref(self):
         # construct_access_tile already handles memref<?xf32> correctly:
         # it reads shape only from the !ktdp.access_tile<...> result type,

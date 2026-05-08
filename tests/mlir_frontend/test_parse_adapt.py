@@ -100,6 +100,8 @@ class TestKtdpAdapt(MLIRFrontendParseTestMixin, _TestKtdpParsers):
     # test_construct_memory_view_dynamic_memref_type: inherited
     # test_construct_memory_view_ssa_size_as_operand: inherited
 
+    # test_construct_memory_view_multi_dim_mixed_static_dynamic: inherited
+
 
 # ---------------------------------------------------------------------------
 # Scf

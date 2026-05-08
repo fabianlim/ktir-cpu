@@ -205,26 +205,37 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     # '?' in the memref type means the dimension is dynamic (value only known at
     # runtime).  We keep it as None until we can substitute the SSA size below.
     memref_dims = [None if p == "?" else int(p) for p in parts[:-1]]
-    # Build shape: prefer SSA size tokens for dynamic dims, fall back to memref_dims.
-    # An SSA name (e.g. "%n_idx") is kept as a string in the shape tuple; the
-    # executor resolves it via context.get_value() at runtime.  The result_type
-    # round-trips the string back to '?' so downstream MLIR consumers see a valid
-    # dynamic memref type.
     if sizes is not None:
+        if len(sizes) != len(memref_dims):
+            raise ValueError(
+                f"construct_memory_view: sizes count {len(sizes)} does not match "
+                f"memref dimension count {len(memref_dims)}"
+            )
         resolved = []
-        for i, s in enumerate(sizes):
-            mem_d = memref_dims[i] if i < len(memref_dims) else None
-            if isinstance(s, str):
-                resolved.append(s)  # SSA name — resolved at runtime
-            elif s is not None and mem_d is not None and s != mem_d:
-                raise ValueError(
-                    f"construct_memory_view: sizes[{i}]={s} does not match "
-                    f"memref dimension {mem_d}"
-                )
+        for i, (s, mem_d) in enumerate(zip(sizes, memref_dims)):
+            if mem_d is not None:
+                # concrete dim — s must equal it
+                if not isinstance(s, str) and s != mem_d:
+                    raise ValueError(
+                        f"construct_memory_view: sizes[{i}]={s} does not match "
+                        f"memref dimension {mem_d}"
+                    )
+                resolved.append(s)
             else:
-                resolved.append(s if s is not None else mem_d)
+                # dynamic dim ('?') — s must be an SSA name
+                if not isinstance(s, str):
+                    raise ValueError(
+                        f"construct_memory_view: sizes[{i}]={s} given for a '?' dim; "
+                        f"dynamic dim requires an SSA name, not a literal"
+                    )
+                resolved.append(s)
         shape = tuple(resolved)
     else:
+        if any(d is None for d in memref_dims):
+            raise ValueError(
+                "construct_memory_view: memref has dynamic '?' dim(s) but no sizes: "
+                "attribute was provided; dynamic dims require SSA sizes"
+            )
         shape = tuple(memref_dims)
 
     attrs = parse_attr_block(op_text, parse_ctx.aliases)

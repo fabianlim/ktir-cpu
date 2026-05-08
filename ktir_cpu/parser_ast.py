@@ -22,31 +22,34 @@ This module owns all AST-level concerns for affine maps and sets:
 
 Public API
 ----------
-parse_affine_map(s)          -> AffineMap
-parse_affine_set(s)          -> AffineSet
-eval_affine_map(amap, dims)  -> tuple[int, ...]
-affine_set_contains(aset, point) -> bool
-enumerate_affine_set(aset, shape) -> list[tuple[int, ...]]
+parse_affine_map(s)                        -> AffineMap
+parse_affine_set(s)                        -> AffineSet
+eval_affine_map(amap, dims)                -> tuple[int, ...]
+affine_set_contains(aset, point, symbols)  -> bool
+enumerate_affine_set(aset, shape, symbols) -> list[tuple[int, ...]]
 
-The first two are called by ``parser.py`` (MLIR structure parser) when it
-encounters an ``affine_map<...>`` or ``affine_set<...>`` string.
-The remaining three are called by the convenience methods on ``AffineMap``
-and ``AffineSet`` in ``affine.py``, and directly by ``memory_ops.py``.
+``parse_affine_map`` / ``parse_affine_set`` are called by ``parser.py``
+when it encounters an ``affine_map<...>`` or ``affine_set<...>`` string.
+The evaluation functions are called by the convenience methods on
+``AffineMap`` and ``AffineSet`` in ``affine.py``, and directly by
+``memory_ops.py``.
 
 Supported scope
 ---------------
-Linear affine expressions only:
-  - Dimension variables:  d0, d1, ...
+Linear affine expressions:
+  - Dimension variables: d0, d1, ... (or arbitrary names via the dim list)
+  - Symbol variables:    s0, s1, ... (or arbitrary names via the symbol list)
   - Integer constants
   - Addition (+), subtraction (-), negation (unary -)
-  - Multiplication by a constant coefficient (N * dI)
+  - Multiplication by a constant coefficient (N * dI or dI * N)
 
-No symbolic identifiers (s0, s1, ...), floordiv, ceildiv, or mod.
+Not supported: floordiv, ceildiv, mod.
 
-Assumption for affine_set enumeration
--------------------------------------
-Constraints are interpreted in *local* (0-based) coordinates within the
-access tile.  The caller passes the tile shape as a bounding box.
+Affine set enumeration
+----------------------
+Constraints are interpreted in local (0-based) coordinates within the
+access tile.  The caller passes the tile shape as a bounding box and,
+for sets with symbol variables, the concrete symbol values.
 """
 
 from __future__ import annotations
@@ -242,11 +245,17 @@ class _Parser:
             self.consume()
             return ("dim", int(tok[1:]))
 
-        # Symbol variable — any identifier that appears in the symbol list.
+        # Symbol variable — any identifier that appears in the symbol list,
+        # e.g. affine_set<(d0)[s0, n] : (d0 >= 0, -d0 + n - 1 >= 0)>.
+        # Symbols are runtime-known constants (unlike dims, which index the
+        # iteration space).  sym_index is populated from the parsed [s0, ...]
+        # list in parse_affine_set; callers pass concrete values via the
+        # ``symbols`` argument to affine_set_contains / enumerate_affine_set.
+        # Fallback: if sym_index is empty (standalone parse_expr call), accept
+        # canonical sN names by parsing the numeric suffix directly (s0→0, ...).
         if tok in self.sym_index:
             self.consume()
             return ("sym", self.sym_index[tok])
-        # Fallback for canonical sN names when sym_index is empty.
         if re.fullmatch(r's\d+', tok) and not self.sym_index:
             self.consume()
             return ("sym", int(tok[1:]))
