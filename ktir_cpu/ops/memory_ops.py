@@ -24,10 +24,42 @@ import numpy as np
 from ..affine import AffineMap
 from ..dialects.ktdp_helpers import eval_subscript_expr
 from ..dtypes import bytes_per_elem as _bytes_per_elem
-from ..ir_types import Tile, TileRef
+from ..ir_types import MemRef, Tile, TileRef
 from ..grid import CoreContext
 from ..memory import HBMSimulator
 
+
+class _MemAccessor:
+    """Resolves a (context, memref, byte_addr) triple into simulator read/write calls.
+
+    This is the single place in the codebase that manages the intra-stick byte
+    offset abstraction: HBMSimulator requires a (stick, intra_byte) address pair
+    while LXScratchpad uses a plain byte address.  ``MemRef.split_addr`` produces
+    the pair; this class captures it and forwards any extra address kwargs to the
+    underlying simulator so callers never handle them directly.
+
+    ``stick_bytes`` is exposed for callers that need to count distinct HBM sticks
+    touched by an access (latency accounting); it is None for LX.
+
+    To extend to a new memory space, add a branch in ``__init__`` that populates
+    ``_args`` and ``_kwargs`` appropriately — ``read`` and ``write`` require no
+    changes.
+    """
+
+    def __init__(self, context: CoreContext, memref: MemRef, byte_addr: int):
+        _main, _intra = memref.split_addr(byte_addr)
+        self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES if memref.memory_space == "HBM" else None
+        self._sim = context.hbm if memref.memory_space == "HBM" else context.lx
+        self._args = (_main,)
+        self._kwargs = {}
+        if memref.memory_space == "HBM":
+            self._kwargs["intra_byte"] = _intra
+
+    def read(self, n: int, dtype: str) -> np.ndarray:
+        return self._sim.read(*self._args, n, dtype, **self._kwargs)
+
+    def write(self, data: np.ndarray) -> None:
+        self._sim.write(*self._args, data, **self._kwargs)
 
 class MemoryOps:
     """Tile memory helpers — view, access, load, store."""
@@ -41,24 +73,24 @@ class MemoryOps:
         memory_space: str,
         dtype: str = "f16",
         coordinate_set: Optional[str] = None,
-    ) -> TileRef:
-        """Create a memory layout descriptor (TileRef).
+    ) -> MemRef:
+        """Create a hardware-aware memory view (MemRef).
 
-        Builds a tile reference describing a contiguous region in HBM or LX.
+        Builds a MemRef describing a contiguous region in HBM or LX.
 
         Args:
             context: Core execution context
-            ptr: Base pointer
+            ptr: Base pointer (stick index for HBM, byte address for LX)
             shape: Tile shape
-            strides: Memory strides
+            strides: Memory strides (element counts)
             memory_space: "HBM" or "LX"
             dtype: Data type
             coordinate_set: Verbatim affine_set string, no evaluation
 
         Returns:
-            TileRef describing the memory layout
+            MemRef describing the memory layout
         """
-        return TileRef(
+        return MemRef(
             base_ptr=ptr,
             shape=shape,
             strides=strides,
@@ -70,39 +102,39 @@ class MemoryOps:
     @staticmethod
     def tile_access(
         context: CoreContext,
-        parent_ref: TileRef,
+        parent_ref: MemRef,
         indices: List[int],
         access_shape: Tuple[int, ...],
         base_map: AffineMap,
     ) -> TileRef:
-        """Extract a sub-tile from a parent tile reference.
+        """Extract a sub-tile from a parent MemRef.
 
         Evaluates *base_map* with *indices* to obtain the base coordinates
         in the parent memref, then computes a byte offset using the parent
-        strides.  The resulting base_ptr is always within the same allocation
-        as parent_ref.base_ptr — this invariant is relied upon by load/store.
+        strides.  The resulting byte address falls within the same physical
+        allocation as parent_ref — this invariant is relied upon by load/store.
 
         Args:
             context: Core execution context
-            parent_ref: Parent tile reference (memref)
+            parent_ref: Parent MemRef (from construct_memory_view)
             indices: Access indices (one per base_map input dim)
             access_shape: Shape of the accessed sub-tile
             base_map: AffineMap mapping indices → base coordinates
 
         Returns:
-            TileRef for the sub-tile
+            TileRef (byte-addressed) for the sub-tile
         """
         base_coords = base_map.eval(indices)
         bpe = _bytes_per_elem(parent_ref.dtype)
-        offset = sum(coord * stride for coord, stride in zip(base_coords, parent_ref.strides))
-        new_ptr = parent_ref.base_ptr + offset * bpe
+        offset_elems = sum(coord * stride for coord, stride in zip(base_coords, parent_ref.strides))
+        byte_pos = parent_ref.byte_address + offset_elems * bpe
 
         return TileRef(
-            base_ptr=new_ptr,
+            base_ptr=byte_pos,
             shape=access_shape,
             strides=parent_ref.strides,
-            memory_space=parent_ref.memory_space,
-            dtype=parent_ref.dtype
+            dtype=parent_ref.dtype,
+            memref=parent_ref,
         )
 
     @staticmethod
@@ -137,24 +169,30 @@ class MemoryOps:
         strides: List[int],
         dtype: str,
         coords: Optional[List[Tuple[int, ...]]] = None,
-    ) -> Tuple[List[int], int]:
-        """Linearize N-d coordinates to flat element offsets and count unique HBM sticks.
+        stick_bytes: Optional[int] = None,
+    ) -> Tuple[List[int], Optional[int]]:
+        """Linearize N-d coordinates to flat element offsets and optionally count sticks.
 
-        O(n) time, O(unique_sticks) memory for the stick set. For very large
-        coord sizes a more efficient implementation may be needed.
+        Args:
+            base_ptr: Byte address of tile start.
+            shape: Tile shape.
+            strides: Element strides.
+            dtype: Element dtype (for bytes_per_elem).
+            coords: Optional coordinate list; if None, enumerates full shape.
+            stick_bytes: If set (HBM), count distinct sticks touched. None skips.
 
         Returns:
-            (offsets, unique_sticks) — flat element offsets and number of
-            distinct HBM sticks touched.
+            (offsets, unique_sticks) — element offsets and stick count (None for LX).
         """
         offsets = []
-        sticks = set()
+        sticks = set() if stick_bytes else None
         bpe = _bytes_per_elem(dtype)
         for coord in (coords if coords is not None else np.ndindex(*shape)):
             o = sum(c * s for c, s in zip(coord, strides))
             offsets.append(o)
-            sticks.add((base_ptr + o * bpe) // HBMSimulator.STICK_BYTES)
-        return offsets, len(sticks)
+            if sticks is not None:
+                sticks.add((base_ptr + o * bpe) // stick_bytes)
+        return offsets, len(sticks) if sticks is not None else None
 
     @staticmethod
     def load(
@@ -206,27 +244,32 @@ class MemoryOps:
         Returns:
             Tile value (tensor) loaded into LX
         """
-        mem = context.hbm if tile_ref.memory_space == "HBM" else context.lx
+        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
+        stick_bytes = mgr.stick_bytes
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
             n = int(np.prod(tile_ref.shape))
-            data = mem.read(tile_ref.base_ptr, n, tile_ref.dtype).reshape(tile_ref.shape)
+            data = mgr.read(n, tile_ref.dtype).reshape(tile_ref.shape)
             MemoryOps._write_to_lx(context, data)
-            bpe = _bytes_per_elem(tile_ref.dtype)
-            end = tile_ref.base_ptr + n * bpe
-            unique_sticks = (
-                (end + HBMSimulator.STICK_BYTES - 1) // HBMSimulator.STICK_BYTES
-                - tile_ref.base_ptr // HBMSimulator.STICK_BYTES
-            )
+            if stick_bytes:
+                bpe = _bytes_per_elem(tile_ref.dtype)
+                end = tile_ref.base_ptr + n * bpe
+                unique_sticks = (
+                    (end + stick_bytes - 1) // stick_bytes
+                    - tile_ref.base_ptr // stick_bytes
+                )
+            else:
+                unique_sticks = None
             return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
 
         # Strided or coord-set path: linearize coords, single read, numpy fancy-index.
         offsets, unique_sticks = MemoryOps._flat_memory_offsets(
-            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
+            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
+            coords, stick_bytes=stick_bytes
         )
         span = max(offsets) + 1 if offsets else 1
-        flat = mem.read(tile_ref.base_ptr, span, tile_ref.dtype)
+        flat = mgr.read(span, tile_ref.dtype)
 
         gathered = flat[offsets]
         out_shape = result_shape if result_shape is not None else tile_ref.shape
@@ -260,11 +303,11 @@ class MemoryOps:
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
         """
-        mem = context.hbm if tile_ref.memory_space == "HBM" else context.lx
+        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            mem.write(tile_ref.base_ptr, tile.data.flatten())
+            mgr.write(tile.data.flatten())
             return
 
         # Strided or coord-set path: read-modify-write via scatter offsets.
@@ -272,9 +315,9 @@ class MemoryOps:
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
         )
         span = max(offsets) + 1 if offsets else 1
-        flat = mem.read(tile_ref.base_ptr, span, tile_ref.dtype)
+        flat = mgr.read(span, tile_ref.dtype)
         flat[offsets] = tile.data.flatten()
-        mem.write(tile_ref.base_ptr, flat)
+        mgr.write(flat)
 
     @staticmethod
     def indirect_load(
@@ -308,10 +351,9 @@ class MemoryOps:
                     idx_coords = tuple(
                         eval_subscript_expr(e, pt) for e in sub["idx_exprs"]
                     )
-                    mem = context.hbm if idx_view.memory_space == "HBM" else context.lx
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
-                    addr = idx_view.base_ptr + offset * _bytes_per_elem(idx_view.dtype)
-                    raw = mem.read(addr, 1, idx_view.dtype)
+                    addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
+                    raw = _MemAccessor(context, idx_view, addr).read(1, idx_view.dtype)
                     coord.append(int(raw[0]))
                 elif sub["kind"] == "direct":
                     coord.append(pt[sub["var_index"]])
@@ -320,4 +362,4 @@ class MemoryOps:
             coords.append(tuple(coord))
 
         out_shape = result_shape if result_shape is not None else iat.shape
-        return MemoryOps.load(context, iat.parent_ref, coords=coords, result_shape=out_shape)
+        return MemoryOps.load(context, iat.parent_ref.to_tile_ref(), coords=coords, result_shape=out_shape)
