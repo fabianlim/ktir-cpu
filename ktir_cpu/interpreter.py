@@ -143,9 +143,9 @@ class KTIRInterpreter:
         input_dtypes = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = self.memory.hbm.allocate(tensor.nbytes)
-                self.memory.hbm.write(ptr, tensor)
-                input_ptrs[arg_name] = ptr
+                stick = self.memory.hbm.allocate(tensor.nbytes)
+                self.memory.hbm.write(stick, tensor)
+                input_ptrs[arg_name] = stick
                 input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
             else:
                 # Scalar argument (like n)
@@ -172,9 +172,9 @@ class KTIRInterpreter:
         outputs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = input_ptrs[arg_name]
+                stick = input_ptrs[arg_name]
                 n_elements = math.prod(tensor.shape)
-                output_data = self.memory.hbm.read(ptr, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
+                output_data = self.memory.hbm.read(stick, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
                 outputs[arg_name] = output_data
 
         return outputs
