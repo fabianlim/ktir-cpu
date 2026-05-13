@@ -19,9 +19,9 @@ Tile view construction, sub-tile access, and HBM/LX load/store
 primitives used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import numpy as np
-from ..affine import AffineMap, AffineSet
+from ..affine import AffineMap, AffineSet, box_set
 from ..dialects.ktdp_helpers import eval_subscript_expr
 from ..dtypes import bytes_per_elem as _bytes_per_elem, to_np_dtype as _to_np_dtype
 from ..ir_types import Tile, TileRef, DistributedTileRef
@@ -29,26 +29,6 @@ from ..grid import CoreContext
 from ..memory import HBMSimulator
 
 
-def partition_origin(coord_set: AffineSet, global_shape: Tuple[int, ...]) -> Tuple[int, ...]:
-    """Find the per-dim minimum global coordinate covered by *coord_set*.
-
-    For an axis-aligned rectangular partition (the common case expressed
-    by affine sets like ``d_i - C >= 0, -d_i + D >= 0``), this is the
-    partition's origin in the global index space, so
-    ``local_coord[i] = global_coord[i] - origin[i]``.
-
-    Works for any convex set shape by enumerating points within
-    *global_shape* and taking the per-dim min; callers should cache the
-    result per distributed view.
-    """
-    points = coord_set.enumerate(global_shape)
-    if not points:
-        raise ValueError(
-            f"Partition coordinate_set is empty over shape {global_shape}: "
-            f"{coord_set.source!r}"
-        )
-    ndim = len(global_shape)
-    return tuple(min(p[i] for p in points) for i in range(ndim))
 
 
 class MemoryOps:
@@ -299,102 +279,180 @@ class MemoryOps:
         mem.write(tile_ref.base_ptr, flat)
 
     @staticmethod
-    def _group_by_partition(
+    def distributed_tile_access(
         dist_ref: DistributedTileRef,
-        coords: List[Tuple[int, ...]],
-    ) -> Dict[int, Tuple[List[int], List[Tuple[int, ...]]]]:
-        """Route each global coord to a partition and translate to local.
+        access_shape: Tuple[int, ...],
+        base_map: AffineMap,
+        indices: List[int],
+        access_tile_set: Optional["AffineSet"] = None,
+    ) -> DistributedTileRef:
+        """Prune and intersect partitions for a given access tile.
 
-        Returns ``{partition_idx: (orig_positions, local_coords)}``.
-        ``orig_positions[k]`` is the index into *coords* that produced
-        ``local_coords[k]`` — used to scatter per-partition results back
-        into a single flat output.
+        Terms
+        -----
+        x             : global_base = base_map.eval(indices).  The global origin
+                        of the access tile.
+        A             : access_tile_set — the affine set on the access tile, in
+                        local coords 0..access_shape-1.  If None, treated as the
+                        full box [0, access_shape).
+        x + A         : the global footprint of the access tile.
+        B_i           : partition i's coordinate_set, in global coords.
+        C_i           : (x + A) ∩ B_i — the global coords covered by both the
+                        access tile and partition i.
+        p_i           : min(B_i) — the global origin of partition i.
+                        base_ptr covers local element [0, 0], i.e. global p_i.
 
-        Per-partition origins are computed lazily (and only once) from
-        each partition's ``coordinate_set`` via :func:`partition_origin`.
+        Algorithm
+        ---------
+        For each partition i:
+          1. Fast prune via corner test (O(2^ndims)): if no corner of x+A is in
+             B_i, the intersection C_i is empty — drop the partition.
+          2. Compute C_i = (x + A) ∩ B_i and p_i = min(B_i).
+          3. Return a new TileRef with coordinate_set=C_i, partition_origin=p_i.
+
+        distributed_load then uses C_i and p_i directly:
+          - load coords into partition i: C_i - p_i  (local offset within base_ptr)
+          - output coords in out:         C_i - x    (local offset within access tile)
+
+        Example — 4×4 tensor, P0 covers rows 0..1, P1 covers rows 2..3,
+        A = full box (no access_tile_set)::
+
+            # Case 1: indices=[0,0], access_shape=(4,4)  → x=(0,0)
+            #   C0 = [0..1]×[0..3],  p0=(0,0)
+            #   C1 = [2..3]×[0..3],  p1=(2,0)
+            #   distributed_load:
+            #     P0: load coords C0-p0=[0..1]×[0..3], out coords C0-x=[0..1]×[0..3]
+            #     P1: load coords C1-p1=[0..1]×[0..3], out coords C1-x=[2..3]×[0..3]
+
+            # Case 2: indices=[0,0], access_shape=(2,4)  → x=(0,0)
+            #   C0 = [0..1]×[0..3],  p0=(0,0)  → P0 survives
+            #   C1 = empty (x+A covers rows 0..1, B1 covers rows 2..3) → P1 pruned
+
+            # Case 3: indices=[1,1], access_shape=(2,2)  → x=(1,1)
+            #   C0 = {row 1}×[1..3],  p0=(0,0)
+            #     load coords C0-p0 = {(1,1),(1,2),(1,3)}
+            #     out  coords C0-x  = {(0,0),(0,1),(0,2)}
+            #   C1 = {row 2}×[1..3],  p1=(2,0)
+            #     load coords C1-p1 = {(0,1),(0,2),(0,3)}
+            #     out  coords C1-x  = {(1,0),(1,1),(1,2)}
         """
+        global_base = base_map.eval(indices)
         ndim = len(dist_ref.shape)
-        origins: Dict[int, Tuple[int, ...]] = {}
-        groups: Dict[int, Tuple[List[int], List[Tuple[int, ...]]]] = {}
-        for pos, coord in enumerate(coords):
-            part_idx, part = dist_ref.find_partition(coord)
-            if part_idx not in origins:
-                origins[part_idx] = partition_origin(part.coordinate_set, dist_ref.shape)
-            origin = origins[part_idx]
-            local = tuple(int(coord[d] - origin[d]) for d in range(ndim))
-            pos_list, local_list = groups.setdefault(part_idx, ([], []))
-            pos_list.append(pos)
-            local_list.append(local)
-        return groups
+
+        # x + A: global footprint of the access tile.
+        # When access_tile_set is None the parser verified A = [0, access_shape),
+        # so x + A = [x, x + access_shape) in global coords.
+        xA = access_tile_set.shift(global_base) if access_tile_set is not None \
+            else box_set(access_shape).shift(global_base)
+
+        survivors: List[TileRef] = []
+        for part in dist_ref.partitions:
+            B_i = part.coordinate_set
+
+            # C_i = (x + A) ∩ B_i — global coords covered by both access tile and partition.
+            C_i = xA.intersect(B_i)
+            C_i_pts = C_i.enumerate(dist_ref.shape)
+            if not C_i_pts:
+                continue
+
+            # p_i = min(B_i) — global origin of partition i (base_ptr == local [0,...,0]).
+            # TODO: AffineSet can't answer this structurally — enumerate B_i as a
+            # fallback.  Refactor coordinate_sets to a BoxRegion type with O(ndim)
+            # lower_bounds/upper_bounds/intersect/is_empty, falling back to AffineSet
+            # only for genuinely non-box sets.
+            B_i_pts = B_i.enumerate(dist_ref.shape)
+            p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
+
+            survivors.append(TileRef(
+                base_ptr=part.base_ptr,
+                shape=part.shape,
+                strides=part.strides,
+                memory_space=part.memory_space,
+                dtype=part.dtype,
+                coordinate_set=C_i,   # global coordinates
+                partition_origin=p_i, # global coordinates
+            ))
+
+        if not survivors:
+            raise ValueError(
+                f"distributed_tile_access: no partition covers access region "
+                f"global_base={global_base} shape={access_shape}"
+            )
+        return DistributedTileRef(
+            partitions=survivors,
+            shape=dist_ref.shape,
+            dtype=dist_ref.dtype,
+            global_base=global_base,
+        )
 
     @staticmethod
-    def load_distributed(
+    def distributed_load(
         context: CoreContext,
         dist_ref: DistributedTileRef,
-        coords: List[Tuple[int, ...]],
         result_shape: Optional[Tuple[int, ...]] = None,
     ) -> Tile:
-        """Gather elements from a distributed view, route per partition.
+        """Load from a pre-resolved DistributedTileRef (output of distributed_tile_access).
 
-        For each global coord, pick the partition whose ``coordinate_set``
-        contains it, translate to that partition's local coord, issue one
-        batched read per partition group, and scatter results back into a
-        single flat output indexed by the coord's original position.
-        Writes the result to LX and returns a :class:`Tile` so the caller
-        sees the same contract as :meth:`load`.
+        Iterates surviving partitions directly. For each partition:
+        - Fast path: coordinate_set covers the full partition shape → bulk read,
+          rectangular assign into the output array.
+        - Slow path: partial coverage → enumerate local coords, gather, scatter.
         """
+        ndim = len(dist_ref.shape)
+        global_base = dist_ref.global_base or (0,) * ndim
         out_shape = result_shape if result_shape is not None else tuple(dist_ref.shape)
-        n_total = len(coords)
-        np_dtype_output = np.zeros(n_total, dtype=_to_np_dtype(dist_ref.dtype))
-
-        groups = MemoryOps._group_by_partition(dist_ref, coords)
-
+        out = np.zeros(out_shape, dtype=_to_np_dtype(dist_ref.dtype))
         total_unique_sticks = 0
-        for part_idx, (orig_positions, local_coords) in groups.items():
-            part = dist_ref.partitions[part_idx]
-            mem = context.hbm if part.memory_space == "HBM" else context.lx
-            offsets, unique_sticks = MemoryOps._flat_memory_offsets(
-                part.base_ptr, part.shape, part.strides, part.dtype, local_coords
-            )
-            span = max(offsets) + 1 if offsets else 1
-            flat = mem.read(part.base_ptr, span, part.dtype)
-            gathered = flat[offsets]
-            # Scatter this partition's values back into their original positions.
-            np_dtype_output[orig_positions] = gathered
-            # TODO: stick counting across mixed memory spaces is approximate;
-            # HBM partitions contribute real DMA traffic, LX partitions don't.
-            total_unique_sticks += unique_sticks
 
-        data = np_dtype_output.reshape(out_shape)
-        MemoryOps._write_to_lx(context, data)
-        return Tile(data, dist_ref.dtype, out_shape, total_unique_sticks)
+        for part in dist_ref.partitions:
+            # C_i = part.coordinate_set (set by distributed_tile_access, global coords)
+            # p_i = part.partition_origin (global origin of partition, base_ptr == local [0,0])
+            C_i_pts = part.coordinate_set.enumerate(dist_ref.shape)
+            p_i = part.partition_origin
+            x = global_base
+
+            # load_coords: C_i - p_i  (local offsets within partition memory)
+            # out_coords:  C_i - x    (local offsets within output array)
+            load_coords = [tuple(pt[d] - p_i[d] for d in range(ndim)) for pt in C_i_pts]
+            out_coords  = [tuple(pt[d] - x[d]   for d in range(ndim)) for pt in C_i_pts]
+
+            tile = MemoryOps.load(context, part, coords=load_coords, result_shape=(len(load_coords),))
+            total_unique_sticks += tile.unique_sticks or 0
+
+            flat_out = out.reshape(-1)
+            out_indices = [sum(c[d] * int(np.prod(out_shape[d+1:])) for d in range(ndim)) for c in out_coords]
+            flat_out[out_indices] = tile.data.flatten()
+
+        MemoryOps._write_to_lx(context, out)
+        return Tile(out, dist_ref.dtype, out_shape, total_unique_sticks)
 
     @staticmethod
-    def store_distributed(
+    def distributed_store(
         context: CoreContext,
         tile: Tile,
         dist_ref: DistributedTileRef,
-        coords: List[Tuple[int, ...]],
     ) -> None:
-        """Scatter a tile across a distributed view, route per partition.
+        """Store to a pre-resolved DistributedTileRef (output of distributed_tile_access).
 
-        Symmetric to :meth:`load_distributed`: group scatter positions by
-        partition, then do one read-modify-write per partition using the
-        existing ``_flat_memory_offsets`` machinery.
+        Symmetric to load_distributed: slice the input tile per partition and
+        store each slice to its partition's memory.
         """
-        groups = MemoryOps._group_by_partition(dist_ref, coords)
-        flat_values = tile.data.flatten()
+        ndim = len(dist_ref.shape)
+        global_base = dist_ref.global_base or (0,) * ndim
 
-        for part_idx, (orig_positions, local_coords) in groups.items():
-            part = dist_ref.partitions[part_idx]
-            mem = context.hbm if part.memory_space == "HBM" else context.lx
-            offsets, _ = MemoryOps._flat_memory_offsets(
-                part.base_ptr, part.shape, part.strides, part.dtype, local_coords
-            )
-            span = max(offsets) + 1 if offsets else 1
-            flat = mem.read(part.base_ptr, span, part.dtype)
-            flat[offsets] = flat_values[orig_positions]
-            mem.write(part.base_ptr, flat)
+        for part in dist_ref.partitions:
+            C_i_pts = part.coordinate_set.enumerate(dist_ref.shape)
+            p_i = part.partition_origin
+            x = global_base
+
+            load_coords = [tuple(pt[d] - p_i[d] for d in range(ndim)) for pt in C_i_pts]
+            out_coords  = [tuple(pt[d] - x[d]   for d in range(ndim)) for pt in C_i_pts]
+
+            flat_in = tile.data.reshape(-1)
+            in_indices = [sum(c[d] * int(np.prod(tile.shape[d+1:])) for d in range(ndim)) for c in out_coords]
+            part_data = np.array([flat_in[i] for i in in_indices], dtype=_to_np_dtype(part.dtype))
+            part_tile = Tile(part_data, part.dtype, (len(load_coords),))
+            MemoryOps.store(context, part_tile, part, coords=load_coords)
 
     @staticmethod
     def indirect_load(

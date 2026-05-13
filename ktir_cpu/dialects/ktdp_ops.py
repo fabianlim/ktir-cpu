@@ -16,7 +16,6 @@
 
 import re
 
-import numpy as np
 
 from .ktdp_helpers import parse_subscript_expr
 from ..ir_types import AccessTile, DistributedTileRef, IndirectAccessTile, Operation, Tile, TileRef
@@ -96,17 +95,12 @@ def ktdp__construct_access_tile(op, context, env):
     # base_map is an AffineMap object (always present; synthesized as identity if absent in MLIR).
     base_map = op.attributes["base_map"]
     if isinstance(parent_ref, DistributedTileRef):
-        # Distributed parent: non-zero base offsets would need an ownership
-        # rule for the origin cell, which we haven't defined.  v1 supports
-        # zero-offset access over the full global domain — matches the RFC
-        # §C.3 reference example (distributed-view-copy.mlir).
-        if any(i != 0 for i in indices):
-            raise NotImplementedError(
-                "construct_access_tile: non-zero indices against a "
-                "DistributedTileRef parent are not yet supported"
-            )
+        access_tile_set = op.attributes.get("coordinate_set")  # A: local-coord affine set
+        resolved = MemoryOps.distributed_tile_access(
+            parent_ref, access_shape, base_map, indices, access_tile_set
+        )
         return AccessTile(
-            parent_ref=parent_ref,
+            parent_ref=resolved,
             shape=access_shape,
             base_map=base_map,
             coordinate_set=op.attributes.get("coordinate_set"),
@@ -122,23 +116,6 @@ def ktdp__construct_access_tile(op, context, env):
     )
 
 
-def _enumerate_access_coords(access_tile: AccessTile) -> list:
-    """Enumerate the coords an access tile touches, applying coordinate_order if set.
-
-    Returns a flat row-major list of coord tuples over ``access_tile.shape``
-    when the coordinate_set/order are trivial, or the (possibly reordered)
-    set-enumeration when they are not.
-    """
-    css = access_tile.coordinate_set
-    cso = access_tile.coordinate_order
-    if css is not None:
-        coords = css.enumerate(access_tile.shape)
-    else:
-        coords = [tuple(int(c) for c in idx) for idx in np.ndindex(*access_tile.shape)]
-    if cso is not None:
-        coords = [cso.eval(pt) for pt in coords]
-    return coords
-
 
 @register("ktdp.load", latency_category=LC.MEMORY)
 def ktdp__load(op, context, env):
@@ -147,10 +124,9 @@ def ktdp__load(op, context, env):
         result_shape = op.attributes.get("_result_shape", access_tile.shape)
         return MemoryOps.indirect_load(context, access_tile, result_shape=result_shape)
     if isinstance(access_tile.parent_ref, DistributedTileRef):
-        coords = _enumerate_access_coords(access_tile)
         result_shape = op.attributes.get("_result_shape", access_tile.shape)
-        return MemoryOps.load_distributed(
-            context, access_tile.parent_ref, coords=coords, result_shape=result_shape
+        return MemoryOps.distributed_load(
+            context, access_tile.parent_ref, result_shape=result_shape
         )
     css = access_tile.coordinate_set    # AffineSet | None
     cso = access_tile.coordinate_order  # AffineMap | None
@@ -171,8 +147,7 @@ def ktdp__store(op, context, env):
     if isinstance(access_tile, IndirectAccessTile):
         raise NotImplementedError("ktdp.store with IndirectAccessTile is not yet supported")
     if isinstance(access_tile.parent_ref, DistributedTileRef):
-        coords = _enumerate_access_coords(access_tile)
-        MemoryOps.store_distributed(context, value, access_tile.parent_ref, coords=coords)
+        MemoryOps.distributed_store(context, value, access_tile.parent_ref)
         return None
     tile_ref = access_tile.parent_ref
     css = access_tile.coordinate_set

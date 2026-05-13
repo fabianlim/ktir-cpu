@@ -12,13 +12,9 @@
 //       naturally be 0 (a common layout in real kernels).
 // NOTE: Simulator caveat — ktir-cpu does not yet honor the `core = N`
 //       index: every `<LX, core = *>` memref resolves to the currently
-//       executing core's single scratchpad.  Within that one LX dict the
-//       two partition footprints must not overlap.  A_LX0's strides [1, 64]
-//       over shape (32, 64) give a max element offset of 31+63*64 = 4063,
-//       so its strided footprint reaches byte 20416 from base 12288 —
-//       hence A_LX1_addr = 20480 here (the slide's 16384 would alias
-//       A_LX0's second-half reads and return A_LX1's data).  Once per-core
-//       LX routing lands, all three partition bases can collapse to 0.
+//       executing core's single scratchpad.  This test is marked xfail
+//       until per-core LX routing is implemented.  Once it lands, all
+//       three partition bases can collapse to 0.
 
 // A is a 192x64 logical tensor partitioned across three memory spaces:
 //   A_HBM  = rows   0..95,  stored on HBM,  row-major    (96x64)
@@ -41,7 +37,7 @@ module {
         // In this example, A is distributed across HBM and two LX scratchpads; B is on HBM
         %A_HBM_addr = arith.constant 0       : index
         %A_LX0_addr = arith.constant 12288   : index
-        %A_LX1_addr = arith.constant 20480   : index
+        %A_LX1_addr = arith.constant 16384   : index
         %B_addr     = arith.constant 24576   : index
 
         // Accessing a tensor in KTIR follows a 3 step process:

@@ -106,6 +106,25 @@ class AffineSet:
         from .parser_ast import enumerate_affine_set
         return enumerate_affine_set(self, shape)
 
+    def shift(self, offset: Sequence[int]) -> "AffineSet":
+        """Return a new AffineSet whose domain is shifted by *offset*.
+
+        A point ``p`` is in ``self.shift(x)`` iff ``p - x`` is in ``self``.
+        Implemented by wrapping contains/enumerate — no AST modification.
+        """
+        return _ShiftedAffineSet(self, tuple(offset))
+
+    def intersect(self, other: "AffineSet") -> "AffineSet":
+        """Return the intersection of this set with *other*.
+
+        A point is in the intersection iff it satisfies both sets.
+        Both sets must have the same n_dims.
+        """
+        assert self.n_dims == other.n_dims, (
+            f"intersect: n_dims mismatch {self.n_dims} vs {other.n_dims}"
+        )
+        return _IntersectedAffineSet(self, other)
+
     def is_full(self, shape: Tuple[int, ...]) -> bool:
         """Return True if this set covers every coordinate in *shape*.
 
@@ -127,3 +146,103 @@ class AffineSet:
         import itertools as _it
         corners = _it.product(*((0, n - 1) for n in shape))
         return all(self.contains(pt) for pt in corners)
+
+
+def _iter_box(shape: Tuple[int, ...]):
+    """Yield all integer coordinate tuples in [0, shape)."""
+    import itertools
+    yield from itertools.product(*[range(s) for s in shape])
+
+
+def box_set(shape: Tuple[int, ...]) -> "AffineSet":
+    """Return an AffineSet covering the full box [0, shape) without parsing.
+
+    A point p is in the box iff 0 <= p[d] < shape[d] for all d.
+    Use .shift(origin) to get a box anchored at a global origin.
+    """
+    return _BoxAffineSet(shape)
+
+
+class _BoxAffineSet(AffineSet):
+    """AffineSet covering the full box [0, shape) — no parsing needed."""
+    def __new__(cls, shape):
+        return object.__new__(cls)
+
+    def __init__(self, shape: Tuple[int, ...]):
+        object.__setattr__(self, 'n_dims', len(shape))
+        object.__setattr__(self, 'constraints', ())
+        object.__setattr__(self, 'source', f"box{shape}")
+        object.__setattr__(self, '_shape', shape)
+
+    def contains(self, point: Sequence[int]) -> bool:
+        return all(0 <= point[d] < self._shape[d] for d in range(self.n_dims))
+
+    def enumerate(self, shape: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+        return list(_iter_box(shape))
+
+
+class _ShiftedAffineSet(AffineSet):
+    """AffineSet shifted by a constant offset.
+
+    ``p in shifted`` iff ``p - offset in base``.
+    """
+
+    def __new__(cls, base: AffineSet, offset: Tuple[int, ...]):
+        obj = object.__new__(cls)
+        return obj
+
+    def __init__(self, base: AffineSet, offset: Tuple[int, ...]):
+        object.__setattr__(self, 'n_dims', base.n_dims)
+        object.__setattr__(self, 'constraints', base.constraints)
+        object.__setattr__(self, 'source', f"shift({base.source}, {offset})")
+        object.__setattr__(self, '_base', base)
+        object.__setattr__(self, '_offset', offset)
+
+    def contains(self, point: Sequence[int]) -> bool:
+        shifted = tuple(point[d] - self._offset[d] for d in range(self.n_dims))
+        return self._base.contains(shifted)
+
+    def enumerate(self, shape: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+        # A point p is in shift(base, x) iff p-x is in base.
+        # Enumerate all p in [0,shape) that satisfy contains(p).
+        return [p for p in _iter_box(shape) if self.contains(p)]
+
+
+class _IntersectedAffineSet(AffineSet):
+    """Intersection of two AffineSets with the same n_dims.
+
+    ``p in intersection`` iff ``p in left AND p in right``.
+
+    enumerate() optimisation: when ``left`` is a shifted box (the common case
+    from distributed_tile_access where left = x+A), we know its tight bounding
+    box and iterate only that sub-region rather than all of ``shape``.
+    """
+    def __new__(cls, left: AffineSet, right: AffineSet):
+        obj = object.__new__(cls)
+        return obj
+
+    def __init__(self, left: AffineSet, right: AffineSet):
+        object.__setattr__(self, 'n_dims', left.n_dims)
+        object.__setattr__(self, 'constraints', left.constraints + right.constraints)
+        object.__setattr__(self, 'source', f"intersect({left.source}, {right.source})")
+        object.__setattr__(self, '_left', left)
+        object.__setattr__(self, '_right', right)
+
+    def contains(self, point: Sequence[int]) -> bool:
+        return self._left.contains(point) and self._right.contains(point)
+
+    def enumerate(self, shape: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+        # Fast path: if left is a shifted box we know its tight bounding region
+        # [offset, offset+box_shape), so enumerate only that sub-region and
+        # filter by right.  This avoids iterating all of `shape` (e.g. 192×64)
+        # when the access tile is small (e.g. 4×4).
+        left = self._left
+        if isinstance(left, _ShiftedAffineSet) and isinstance(left._base, _BoxAffineSet):
+            import itertools
+            offset = left._offset
+            box_shape = left._base._shape
+            candidates = itertools.product(
+                *(range(offset[d], offset[d] + box_shape[d]) for d in range(self.n_dims))
+            )
+            return [p for p in candidates if self._right.contains(p)]
+        return [p for p in _iter_box(shape) if self.contains(p)]
