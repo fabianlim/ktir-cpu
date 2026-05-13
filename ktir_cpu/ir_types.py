@@ -26,7 +26,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
-from .affine import AffineMap, AffineSet
+from .affine import AffineMap, AffineSet, BoxSet
+
+# Type alias for TileRef.coordinate_set: parsed affine sets lower to BoxSet
+# at parse time when axis-aligned; non-box sets stay as AffineSet; the
+# distributed fast path stores a BoxSet (C_i = B_i ∩ (x + A)); the
+# distributed slow path stores a pre-enumerated list of points.
+CoordinateSet = Union[BoxSet, AffineSet, List[Tuple[int, ...]]]
 
 
 @dataclass
@@ -87,15 +93,17 @@ class TileRef:
     strides: List[int]
     memory_space: str  # "HBM" or "LX"
     dtype: str = "f16"
-    # coordinate_set is normally a parsed AffineSet (or None if omitted in MLIR).
-    # distributed_tile_access overloads this field with a pre-enumerated
-    # List[Tuple[int, ...]] (the points in C_i = B_i ∩ (x + A)) so that
-    # distributed_load/store can iterate without access context.
-    # TODO: this type-lie is a stopgap.  The affine-set refactor will replace
-    # AffineSet with a proper region type that can represent B_i, C_i, shifts,
-    # intersections, and enumerate cheaply — at which point C_i is just another
-    # region and this field stays typed correctly.
-    coordinate_set: Optional[AffineSet] = None
+    # coordinate_set is one of three forms, chosen by the path that built this
+    # TileRef (see the CoordinateSet alias above):
+    #   - BoxSet: axis-aligned set, produced by parse-time lowering and by
+    #     the distributed_tile_access fast path (C_i = B_i ∩ (x + A) when all
+    #     inputs are boxes).  O(ndim) structural ops.
+    #   - AffineSet: non-axis-aligned or symbolic set — parse-time fallback.
+    #   - List[Tuple[int,...]]: pre-enumerated C_i points from the slow path
+    #     in distributed_tile_access (used when access_tile_set is an
+    #     AffineSet, so C_i isn't representable as a single box).
+    #   - None: full-box sentinel (load/store contiguous fast path).
+    coordinate_set: Optional[CoordinateSet] = None
     partition_origin: Optional[Tuple[int, ...]] = None  # min(B_i) in global coords;
                                                         # set by distributed_tile_access,
                                                         # None on construct_memory_view

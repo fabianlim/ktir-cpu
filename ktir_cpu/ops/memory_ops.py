@@ -19,9 +19,9 @@ Tile view construction, sub-tile access, and HBM/LX load/store
 primitives used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import numpy as np
-from ..affine import AffineMap, AffineSet
+from ..affine import AffineMap, AffineSet, BoxSet
 from ..dialects.ktdp_helpers import eval_subscript_expr
 from ..dtypes import bytes_per_elem as _bytes_per_elem, to_np_dtype as _to_np_dtype
 from ..ir_types import Tile, TileRef, DistributedTileRef
@@ -340,7 +340,18 @@ class MemoryOps:
         ndim = len(dist_ref.shape)
         x = global_base
 
-        # Membership test for "p ∈ x + A" (local coords A, global footprint x + A).
+        # Access-set footprint x + A in global coords.  When both A and every
+        # B_i are BoxSet (the common case after parse-time lowering), the
+        # intersection is a single O(ndim) operation; otherwise we fall back
+        # to per-point membership testing.
+        xA_box: Optional[BoxSet] = None
+        if access_tile_set is None:
+            xA_box = BoxSet(lo=tuple(x), hi=tuple(x[d] + access_shape[d] for d in range(ndim)))
+        elif isinstance(access_tile_set, BoxSet):
+            xA_box = access_tile_set.translate(x)
+
+        # Slow-path membership test for "p ∈ x + A" (local coords A, global
+        # footprint x + A).  Used when access_tile_set is an AffineSet.
         def _in_xA(p: Tuple[int, ...]) -> bool:
             if access_tile_set is None:
                 return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
@@ -349,26 +360,33 @@ class MemoryOps:
         survivors: List[TileRef] = []
         for part in dist_ref.partitions:
             B_i = part.coordinate_set
-            # Enumerate B_i once; compute p_i = min(B_i) and C_i_pts = B_i ∩ (x + A)
-            # in the same pass.
-            B_i_pts = B_i.enumerate(dist_ref.shape)
-            if not B_i_pts:
-                continue
-            p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
-            C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
-            if not C_i_pts:
-                continue
+            if isinstance(B_i, BoxSet) and xA_box is not None:
+                # Fast path: axis-aligned intersection in O(ndim).
+                C_i: "Union[BoxSet, List[Tuple[int, ...]]]" = B_i.intersect(xA_box)
+                if C_i.is_empty():
+                    continue
+                p_i = B_i.lower_bounds()
+                coordinate_set_out: "Union[BoxSet, List[Tuple[int, ...]]]" = C_i
+            else:
+                # Slow path: brute-force enumerate B_i and filter by x + A.
+                # Triggered when B_i is an AffineSet (non-axis-aligned) or
+                # when access_tile_set is an AffineSet (non-axis-aligned A).
+                B_i_pts = B_i.enumerate(dist_ref.shape)
+                if not B_i_pts:
+                    continue
+                p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
+                C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
+                if not C_i_pts:
+                    continue
+                coordinate_set_out = C_i_pts
 
-            # TODO: C_i_pts stored as a point list in `coordinate_set` — not an
-            # AffineSet.  To be replaced by a proper region type in the affine
-            # refactor so this field stays correctly typed.
             survivors.append(TileRef(
                 base_ptr=part.base_ptr,
                 shape=part.shape,
                 strides=part.strides,
                 memory_space=part.memory_space,
                 dtype=part.dtype,
-                coordinate_set=C_i_pts,  # type: ignore[arg-type]
+                coordinate_set=coordinate_set_out,
                 partition_origin=p_i,
             ))
 
@@ -404,9 +422,10 @@ class MemoryOps:
         total_unique_sticks = 0
 
         for part in dist_ref.partitions:
-            # coordinate_set holds C_i_pts (List[Tuple[int,...]]) here — see
-            # distributed_tile_access.  TODO: fix typing in the affine refactor.
-            C_i_pts = part.coordinate_set
+            # coordinate_set is either a BoxSet (distributed fast path) or a
+            # pre-enumerated point list (slow path), set by distributed_tile_access.
+            cs = part.coordinate_set
+            C_i_pts = cs.enumerate() if isinstance(cs, BoxSet) else cs
             p_i = part.partition_origin
             x = global_base
 
@@ -440,9 +459,10 @@ class MemoryOps:
         global_base = dist_ref.global_base or (0,) * ndim
 
         for part in dist_ref.partitions:
-            # coordinate_set holds C_i_pts (List[Tuple[int,...]]) here — see
-            # distributed_tile_access.  TODO: fix typing in the affine refactor.
-            C_i_pts = part.coordinate_set
+            # coordinate_set is either a BoxSet (distributed fast path) or a
+            # pre-enumerated point list (slow path), set by distributed_tile_access.
+            cs = part.coordinate_set
+            C_i_pts = cs.enumerate() if isinstance(cs, BoxSet) else cs
             p_i = part.partition_origin
             x = global_base
 

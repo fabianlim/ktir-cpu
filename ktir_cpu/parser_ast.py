@@ -53,9 +53,9 @@ from __future__ import annotations
 
 import itertools
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
-from .affine import AffineMap, AffineSet
+from .affine import AffineMap, AffineSet, BoxSet
 
 
 # ---------------------------------------------------------------------------
@@ -328,13 +328,13 @@ def parse_affine_map(s: str) -> AffineMap:
     )
 
 
-def parse_affine_set(s: str) -> AffineSet:
-    """Parse ``affine_set<(d0,...) : (c0 >= 0, ...)>`` into an :class:`AffineSet`.
+def parse_affine_set_raw(s: str) -> AffineSet:
+    """Parse ``affine_set<...>`` into an :class:`AffineSet` without lowering.
 
-    The ``affine_set<...>`` wrapper is optional.
-
-    Raises:
-        ValueError: on any parse error.
+    Unlike :func:`parse_affine_set`, this always returns an ``AffineSet`` —
+    no parse-time lowering to :class:`BoxSet`.  Used by tests that
+    validate the constraint AST structure, and as a building block for
+    :func:`parse_affine_set`.
     """
     source = s.strip()
     inner = _strip_outer(source, "affine_set")
@@ -358,6 +358,27 @@ def parse_affine_set(s: str) -> AffineSet:
         constraints=tuple(constraints),
         source=source,
     )
+
+
+def parse_affine_set(s: str) -> "Union[BoxSet, AffineSet]":
+    """Parse ``affine_set<(d0,...) : (c0 >= 0, ...)>``.
+
+    Returns a :class:`BoxSet` when the set is axis-aligned and both lo/hi
+    are pinned on every axis; otherwise returns the :class:`AffineSet`
+    fallback.  The ``affine_set<...>`` wrapper is optional.  For tests that
+    need the raw ``AffineSet`` regardless of lowerability, call
+    :func:`parse_affine_set_raw`.
+
+    Raises:
+        ValueError: on any parse error.
+    """
+    aset = parse_affine_set_raw(s)
+    # Lower to BoxSet when the set is an axis-aligned, fully-pinned box.
+    # Falls through to AffineSet for non-box or partially-pinned sets, and
+    # for symbolic sets once PR #42 lands (try_from_affine_set rejects
+    # n_syms > 0 via getattr).
+    box = BoxSet.try_from_affine_set(aset)
+    return box if box is not None else aset
 
 
 # ---------------------------------------------------------------------------
