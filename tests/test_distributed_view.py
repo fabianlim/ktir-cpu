@@ -568,3 +568,194 @@ def test_distributed_copy(spec: DistCopySpec):
     """
     expected, actual = _seed_and_run(spec)
     np.testing.assert_array_equal(actual, expected)
+
+
+# ---------------------------------------------------------------------------
+# Structural: fast path produces BoxSet in surviving partitions
+# ---------------------------------------------------------------------------
+
+def test_distributed_tile_access_fast_path_emits_box_region():
+    """When B_i and A are both boxes, C_i must be stored as a BoxSet.
+
+    Confirms that the BoxSet refactor wires end-to-end: parse-time
+    lowering turns the partition coordinate_set into BoxSet, and
+    distributed_tile_access's fast path stores the intersection as a
+    BoxSet (not a pre-enumerated point list).  A regression here would
+    silently drop us to the slow path and re-introduce the per-partition
+    enumeration cost.
+    """
+    from ktir_cpu.affine import AffineMap, BoxSet
+    from ktir_cpu.ir_types import DistributedTileRef, TileRef
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map, parse_affine_set
+
+    # Build 2 row-band partitions of a 4×4 tensor: P0 rows 0..1, P1 rows 2..3.
+    B0 = parse_affine_set("affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 3 >= 0)>")
+    B1 = parse_affine_set("affine_set<(d0, d1) : (d0 - 2 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>")
+    assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)  # sanity
+
+    P0 = TileRef(base_ptr=0, shape=(2, 4), strides=[4, 1], memory_space="HBM", coordinate_set=B0)
+    P1 = TileRef(base_ptr=64, shape=(2, 4), strides=[4, 1], memory_space="HBM", coordinate_set=B1)
+    dist = DistributedTileRef(partitions=[P0, P1], shape=(4, 4), dtype="f16", global_base=(0, 0))
+
+    # Full-tile access from the origin: both partitions survive with their
+    # own extents as C_i.
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    assert isinstance(base_map, AffineMap)
+    out = MemoryOps.distributed_tile_access(
+        dist_ref=dist,
+        access_shape=(4, 4),
+        base_map=base_map,
+        indices=[0, 0],
+        access_tile_set=None,
+    )
+    assert len(out.partitions) == 2
+    for part in out.partitions:
+        assert isinstance(part.coordinate_set, BoxSet), (
+            f"fast path must store BoxSet in coordinate_set, got "
+            f"{type(part.coordinate_set).__name__}"
+        )
+    # P0 survives with rows 0..1 × cols 0..3; P1 with rows 2..3 × cols 0..3.
+    assert out.partitions[0].coordinate_set == BoxSet(lo=(0, 0), hi=(2, 4))
+    assert out.partitions[1].coordinate_set == BoxSet(lo=(2, 0), hi=(4, 4))
+    # partition_origin == min(B_i)
+    assert out.partitions[0].partition_origin == (0, 0)
+    assert out.partitions[1].partition_origin == (2, 0)
+
+
+# ---------------------------------------------------------------------------
+# distributed_tile_access fast/slow path: verified against a static fixture
+#
+# Scenario (shared by both tests below):
+#   - 256×512 distributed view, 4 row-band partitions of 64×512
+#     (partition_rows scaled down from the 2048×8192 Triton matmul view
+#     so the slow path's brute-force enumeration stays CI-tractable).
+#   - Access tile shape 32×128 — matches the A-tile size in
+#     examples/triton-ktir/matmul_fwd_ktir.mlir.
+#   - base_map = identity; access_tile_set = None (full box A).
+#
+# Fixture: for each indices value, the expected list of surviving partitions,
+# each described by (C_i extent as (lo, hi), expected partition_origin).
+# C_i = [max(r, r0_i), min(r+32, r1_i)) × [c, c+128) where x = (r, c).
+# ---------------------------------------------------------------------------
+
+_SHAPE = (256, 512)
+_PARTITION_ROWS = [(0, 64), (64, 128), (128, 192), (192, 256)]
+_ACCESS_SHAPE = (32, 128)
+
+# Each fixture entry: (id, indices, [(C_i_lo, C_i_hi, partition_origin), ...])
+# partition_origin = (r0_i, 0) — the lower corner of the partition's own extent.
+_FIXTURE = [
+    # Access origin inside P0, no boundary crossing.
+    ("single_partition", (10, 0), [
+        ((10, 0), (42, 128), (0, 0)),
+    ]),
+    # Access rows 50..81 span P0 (rows 50..63) and P1 (rows 64..81).
+    ("cross_boundary", (50, 64), [
+        ((50, 64), (64, 192), (0, 0)),
+        ((64, 64), (82, 192), (64, 0)),
+    ]),
+    # Access rows 200..231, cols 256..383 — lands inside P3 only.
+    ("last_partition", (200, 256), [
+        ((200, 256), (232, 384), (192, 0)),
+    ]),
+    # Access from origin: first 32 rows of P0, first 128 cols.
+    ("origin", (0, 0), [
+        ((0, 0), (32, 128), (0, 0)),
+    ]),
+]
+
+
+def _build_partitions(parser):
+    """Build 4 row-band partitions with coordinate_set parsed by *parser*.
+
+    Passing ``parse_affine_set`` lowers axis-aligned sets to BoxSet
+    (fast path); ``parse_affine_set_raw`` keeps them as AffineSet (slow path).
+    """
+    from ktir_cpu.ir_types import TileRef
+    _, ncols = _SHAPE
+    parts: List[TileRef] = []
+    for r0, r1 in _PARTITION_ROWS:
+        src = (
+            f"affine_set<(d0, d1) : "
+            f"(d0 - {r0} >= 0, -d0 + {r1 - 1} >= 0, "
+            f"d1 >= 0, -d1 + {ncols - 1} >= 0)>"
+        )
+        parts.append(TileRef(
+            base_ptr=r0 * ncols * 2,   # f16 = 2 bytes; placeholder addr
+            shape=(r1 - r0, ncols),
+            strides=[ncols, 1],
+            memory_space="HBM",
+            coordinate_set=parser(src),
+        ))
+    return parts
+
+
+def _run_and_collect(partitions, indices):
+    """Run distributed_tile_access and return [(C_i_pts_sorted, origin), ...]."""
+    from ktir_cpu.affine import AffineMap, BoxSet
+    from ktir_cpu.ir_types import DistributedTileRef
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map
+
+    dist = DistributedTileRef(
+        partitions=partitions, shape=_SHAPE, dtype="f16", global_base=(0, 0),
+    )
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    assert isinstance(base_map, AffineMap)
+    out = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=_ACCESS_SHAPE,
+        base_map=base_map, indices=list(indices), access_tile_set=None,
+    )
+    collected = []
+    for part in out.partitions:
+        cs = part.coordinate_set
+        pts = cs.enumerate() if isinstance(cs, BoxSet) else cs
+        collected.append((sorted(pts), part.partition_origin, type(cs)))
+    return collected
+
+
+def _expected_points(lo, hi):
+    """Expand a box [lo, hi) into a sorted row-major point list."""
+    import itertools as _it
+    return sorted(_it.product(*(range(lo[d], hi[d]) for d in range(len(lo)))))
+
+
+@pytest.mark.parametrize("case_id, indices, expected", _FIXTURE, ids=[c[0] for c in _FIXTURE])
+def test_distributed_tile_access_fast_path(case_id, indices, expected):
+    """Fast path (BoxSet) produces the expected C_i extents and origins."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.parser_ast import parse_affine_set
+
+    got = _run_and_collect(_build_partitions(parse_affine_set), indices)
+    assert len(got) == len(expected), f"{case_id}: partition count mismatch"
+    for (pts_got, origin_got, cs_type), (exp_lo, exp_hi, exp_origin) in zip(got, expected):
+        assert cs_type is BoxSet, f"{case_id}: fast path must emit BoxSet, got {cs_type.__name__}"
+        assert origin_got == exp_origin, f"{case_id}: origin {origin_got} != {exp_origin}"
+        assert pts_got == _expected_points(exp_lo, exp_hi), (
+            f"{case_id}: C_i mismatch for partition at origin {origin_got}"
+        )
+
+
+@pytest.mark.parametrize("case_id, indices, expected", _FIXTURE, ids=[c[0] for c in _FIXTURE])
+def test_distributed_tile_access_slow_path(case_id, indices, expected):
+    """Slow path (AffineSet brute-force enumerate) produces the same C_i.
+
+    Parses partition coordinate_sets via parse_affine_set_raw, which skips
+    the BoxSet lowering, forcing distributed_tile_access onto the
+    AffineSet.enumerate path.  Exercises ~130k AST walks per partition at
+    this fixture size — slow but tractable for CI, and confirms the two
+    paths agree on real-scale inputs.
+    """
+    from ktir_cpu.affine import AffineSet
+    from ktir_cpu.parser_ast import parse_affine_set_raw
+
+    got = _run_and_collect(_build_partitions(parse_affine_set_raw), indices)
+    assert len(got) == len(expected), f"{case_id}: partition count mismatch"
+    for (pts_got, origin_got, cs_type), (exp_lo, exp_hi, exp_origin) in zip(got, expected):
+        # Slow path stores a point list in coordinate_set, not a BoxSet.
+        assert cs_type is list, f"{case_id}: slow path must emit list, got {cs_type.__name__}"
+        assert origin_got == exp_origin, f"{case_id}: origin {origin_got} != {exp_origin}"
+        assert pts_got == _expected_points(exp_lo, exp_hi), (
+            f"{case_id}: C_i mismatch for partition at origin {origin_got}"
+        )
