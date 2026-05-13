@@ -574,7 +574,7 @@ def test_distributed_copy(spec: DistCopySpec):
 # Structural: fast path produces BoxSet in surviving partitions
 # ---------------------------------------------------------------------------
 
-def test_distributed_tile_access_fast_path_emits_box_region():
+def test_distributed_tile_access_fast_path_emits_box_set():
     """When B_i and A are both boxes, C_i must be stored as a BoxSet.
 
     Confirms that the BoxSet refactor wires end-to-end: parse-time
