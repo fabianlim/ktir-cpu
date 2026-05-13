@@ -19,6 +19,7 @@ import re
 from ..ir_types import Operation
 from ..latency import LatencyCategory as LC
 from ..ops.control_ops import ControlOps
+from ..parser_utils import find_ssa_names
 from .registry import register, register_parser
 
 
@@ -168,7 +169,7 @@ def parse_scf_yield(op_text, parse_ctx):
     if yield_match:
         rest = yield_match.group(1)
     operand_text = rest.split(':')[0] if ':' in rest else rest
-    operands = re.findall(r'%\w+', operand_text)
+    operands = find_ssa_names(operand_text)
     return Operation(
         result=None,
         op_type="scf.yield",

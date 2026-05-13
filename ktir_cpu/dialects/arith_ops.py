@@ -20,6 +20,7 @@ import re
 import numpy as np
 
 from ..dtypes import to_np_dtype
+from ..parser_utils import find_ssa_names
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
@@ -563,7 +564,7 @@ def parse_arith_cmpi(op_text, parse_ctx):
         raise ValueError(f"arith.cmpi: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
 
-    operands = re.findall(r'%\w+', op_text)
+    operands = find_ssa_names(op_text)
     operands = [o for o in operands if o != result_name]
 
     result_type = "unknown"
@@ -594,7 +595,7 @@ def parse_arith_cmpf(op_text, parse_ctx):
         raise ValueError(f"arith.cmpf: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
 
-    operands = re.findall(r'%\w+', op_text)
+    operands = find_ssa_names(op_text)
     operands = [o for o in operands if o != result_name]
 
     result_type = "i1"
