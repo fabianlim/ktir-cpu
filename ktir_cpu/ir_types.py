@@ -159,6 +159,10 @@ class TileRef:
     strides: List[int]         # element counts
     memref: 'MemRef'           # parent MemRef — always set; owns memory_space and hw address conversion
     dtype: str = "f16"
+    # Per-survivor metadata set by distributed_tile_access; None on
+    # ordinary single-allocation TileRefs.
+    coordinate_set: Optional[List[Tuple[int, ...]]] = None  # C_i in global coords (slow path)
+    partition_origin: Optional[Tuple[int, ...]] = None      # p_i = min(B_i) in global coords
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""

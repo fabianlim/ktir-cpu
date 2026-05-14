@@ -372,6 +372,21 @@ class MemoryOps:
 
     # ------------------------------------------------------------------
     # Distributed memory views (RFC 0682 §3.3)
+    #
+    # Naming used throughout:
+    #   x   = global_base = base_map.eval(indices) — global origin of
+    #         the access tile
+    #   A   = access_tile_set, in local coords 0..access_shape-1; None
+    #         means the full box [0, access_shape)
+    #   x+A = global footprint of the access tile
+    #   B_i = partition i's coordinate_set, in global coords
+    #   C_i = (x + A) ∩ B_i — global coords covered by both the access
+    #         tile and partition i; per-survivor coordinate_set
+    #   p_i = min(B_i) — partition i's origin in global coords
+    #
+    # distributed_load consumes C_i and p_i directly:
+    #   load coords (partition-local) = C_i - p_i
+    #   output coords (access-local)  = C_i - x
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -382,24 +397,54 @@ class MemoryOps:
         indices: List[int],
         access_tile_set: Optional[AffineSet] = None,
     ) -> DistributedTileRef:
-        """Construct a DistributedTileRef from a DistributedMemRef + access tile.
+        """Resolve partition routing once, return a DistributedTileRef.
 
-        v1 (C1): pass-through partition resolution.  Each partition becomes
-        a survivor TileRef pointing to that partition's full allocation;
-        per-coord routing happens at load/store time via
-        :meth:`DistributedMemRef.find_partition`.  C2 will narrow each
-        survivor to its own ``C_i = (x + A) ∩ B_i``.
+        For each partition i:
+          1. Enumerate B_i over the global view shape; skip if empty.
+          2. Compute p_i = min(B_i) (per-dim minimum).
+          3. Filter to C_i = points of B_i that lie within x + A.
+             - access_tile_set None ⇒ A is the full box [0, access_shape).
+             - access_tile_set AffineSet ⇒ membership tested point-by-point.
+          4. Drop the partition if C_i is empty.
+          5. Otherwise emit a survivor TileRef with
+             ``coordinate_set = C_i`` (List[Tuple[int,...]]),
+             ``partition_origin = p_i``, ``memref = P_i``,
+             ``base_ptr = P_i.byte_address`` (full partition base; load/
+             store will translate per-coord via C_i - p_i).
         """
         global_base = tuple(base_map.eval(indices))
+        x = global_base
+        ndim = len(dist_ref.shape)
+
+        def _in_xA(p: Tuple[int, ...]) -> bool:
+            if access_tile_set is None:
+                return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
+            return access_tile_set.contains(tuple(p[d] - x[d] for d in range(ndim)))
+
         survivors: List[TileRef] = []
         for part in dist_ref.partitions:
+            B_i_pts = part.coordinate_set.enumerate(dist_ref.shape)
+            if not B_i_pts:
+                continue
+            p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
+            C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
+            if not C_i_pts:
+                continue
             survivors.append(TileRef(
                 base_ptr=part.byte_address,
                 shape=part.shape,
                 strides=list(part.strides),
                 memref=part,
                 dtype=part.dtype,
+                coordinate_set=C_i_pts,
+                partition_origin=p_i,
             ))
+
+        if not survivors:
+            raise ValueError(
+                f"distributed_tile_access: no partition covers access region "
+                f"global_base={global_base} shape={access_shape}"
+            )
         return DistributedTileRef(
             partitions=survivors,
             shape=dist_ref.shape,
@@ -408,98 +453,34 @@ class MemoryOps:
         )
 
     @staticmethod
-    def _enumerate_dist_coords(
-        dist_tile_ref: DistributedTileRef, result_shape: Tuple[int, ...]
-    ) -> List[Tuple[int, ...]]:
-        """Enumerate the global coords covered by a DistributedTileRef access.
-
-        v1 (C1): the access region is the full result_shape, anchored at
-        ``global_base``.  C2 will replace this with per-survivor C_i
-        enumeration.
-        """
-        x = dist_tile_ref.global_base
-        if x is None:
-            x = (0,) * len(result_shape)
-        ndim = len(result_shape)
-        return [
-            tuple(x[d] + idx[d] for d in range(ndim))
-            for idx in np.ndindex(*result_shape)
-        ]
-
-    @staticmethod
-    def _route_coords_to_partitions(
-        dist_tile_ref: DistributedTileRef,
-        coords: List[Tuple[int, ...]],
-    ) -> Dict[int, Tuple[List[int], List[Tuple[int, ...]]]]:
-        """Group global *coords* by owning partition and translate to local.
-
-        Returns ``{partition_idx: (orig_positions, local_coords)}``.
-        ``orig_positions[k]`` is the index into *coords* that produced
-        ``local_coords[k]`` — used to scatter per-partition results back
-        into the flat output buffer.
-
-        Per-partition origin (= ``min(B_i)``) is computed lazily and once.
-        """
-        ndim = len(dist_tile_ref.shape)
-        origins: Dict[int, Tuple[int, ...]] = {}
-        groups: Dict[int, Tuple[List[int], List[Tuple[int, ...]]]] = {}
-        # Build a virtual DistributedMemRef-like view from the survivor
-        # MemRefs so we can reuse find_partition semantics without the
-        # dataclass validation.  In C1 the survivors' memref fields are
-        # exactly the partitions of the original DistributedMemRef.
-        partition_memrefs = [s.memref for s in dist_tile_ref.partitions]
-        for pos, coord in enumerate(coords):
-            part_idx = None
-            for i, p_memref in enumerate(partition_memrefs):
-                if p_memref.coordinate_set.contains(coord):
-                    part_idx = i
-                    break
-            if part_idx is None:
-                raise IndexError(
-                    f"distributed access: no partition contains global coord {coord}"
-                )
-            if part_idx not in origins:
-                p_set = partition_memrefs[part_idx].coordinate_set
-                pts = p_set.enumerate(dist_tile_ref.shape)
-                if not pts:
-                    raise ValueError(
-                        f"distributed access: partition {part_idx} coordinate_set "
-                        f"is empty over shape {dist_tile_ref.shape}"
-                    )
-                origins[part_idx] = tuple(min(p[d] for p in pts) for d in range(ndim))
-            origin = origins[part_idx]
-            local = tuple(int(coord[d] - origin[d]) for d in range(ndim))
-            pos_list, local_list = groups.setdefault(part_idx, ([], []))
-            pos_list.append(pos)
-            local_list.append(local)
-        return groups
-
-    @staticmethod
     def distributed_load(
         context: CoreContext,
         dist_tile_ref: DistributedTileRef,
         result_shape: Optional[Tuple[int, ...]] = None,
     ) -> Tile:
-        """Gather elements across partitions and return a single LX-resident Tile.
+        """Gather elements across surviving partitions into a single LX-resident Tile.
 
-        For each global coord in the access region, route to the owning
-        partition, translate to that partition's local coord, issue one
-        batched read per partition group, and scatter the values back into
-        a flat output buffer indexed by the coord's original position.
-        Writes the result into LX so the caller sees the same contract as
-        :meth:`load`.
+        Per survivor: translate C_i to partition-local coords (C_i - p_i),
+        issue one batched read, scatter into the access-local positions
+        (C_i - x) of the output buffer.
         """
+        x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
+        ndim = len(dist_tile_ref.shape)
         out_shape = (
             tuple(result_shape) if result_shape is not None else tuple(dist_tile_ref.shape)
         )
-        coords = MemoryOps._enumerate_dist_coords(dist_tile_ref, out_shape)
-        n_total = len(coords)
-        out_flat = np.zeros(n_total, dtype=_to_np_dtype(dist_tile_ref.dtype))
-        groups = MemoryOps._route_coords_to_partitions(dist_tile_ref, coords)
+        out = np.zeros(out_shape, dtype=_to_np_dtype(dist_tile_ref.dtype))
 
         total_unique_sticks = 0
-        for part_idx, (orig_positions, local_coords) in groups.items():
-            survivor = dist_tile_ref.partitions[part_idx]
+        for survivor in dist_tile_ref.partitions:
+            C_i = survivor.coordinate_set or []
+            p_i = survivor.partition_origin or (0,) * ndim
+            local_coords = [
+                tuple(c[d] - p_i[d] for d in range(ndim)) for c in C_i
+            ]
+            access_coords = [
+                tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
+            ]
             mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr)
             offsets, unique_sticks = MemoryOps._flat_memory_offsets(
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
@@ -507,14 +488,14 @@ class MemoryOps:
             )
             span = max(offsets) + 1 if offsets else 1
             flat = mgr.read(span, survivor.dtype)
-            out_flat[orig_positions] = flat[offsets]
+            for ac, off in zip(access_coords, offsets):
+                out[ac] = flat[off]
             if unique_sticks is not None:
                 total_unique_sticks += unique_sticks
 
-        data = out_flat.reshape(out_shape)
-        MemoryOps._write_to_lx(context, data)
+        MemoryOps._write_to_lx(context, out)
         return Tile(
-            data,
+            out,
             dist_tile_ref.dtype,
             out_shape,
             total_unique_sticks if total_unique_sticks else None,
@@ -526,19 +507,24 @@ class MemoryOps:
         tile: Tile,
         dist_tile_ref: DistributedTileRef,
     ) -> None:
-        """Scatter a tile across partitions, symmetric to :meth:`distributed_load`.
+        """Scatter a tile to surviving partitions, symmetric to :meth:`distributed_load`.
 
-        For each global coord covered by the access region, route to the
-        owning partition and translate to that partition's local coord;
-        per partition, do one read-modify-write covering the partition's
-        scatter targets.
+        Per survivor: select tile elements at access-local positions
+        (C_i - x), write them to partition-local positions (C_i - p_i)
+        via one read-modify-write.
         """
-        coords = MemoryOps._enumerate_dist_coords(dist_tile_ref, tile.shape)
-        groups = MemoryOps._route_coords_to_partitions(dist_tile_ref, coords)
-        flat_values = tile.data.flatten()
+        x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
+        ndim = len(dist_tile_ref.shape)
 
-        for part_idx, (orig_positions, local_coords) in groups.items():
-            survivor = dist_tile_ref.partitions[part_idx]
+        for survivor in dist_tile_ref.partitions:
+            C_i = survivor.coordinate_set or []
+            p_i = survivor.partition_origin or (0,) * ndim
+            local_coords = [
+                tuple(c[d] - p_i[d] for d in range(ndim)) for c in C_i
+            ]
+            access_coords = [
+                tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
+            ]
             mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr)
             offsets, _ = MemoryOps._flat_memory_offsets(
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
@@ -546,5 +532,6 @@ class MemoryOps:
             )
             span = max(offsets) + 1 if offsets else 1
             flat = mgr.read(span, survivor.dtype)
-            flat[offsets] = flat_values[orig_positions]
+            for ac, off in zip(access_coords, offsets):
+                flat[off] = tile.data[ac]
             mgr.write(flat)
