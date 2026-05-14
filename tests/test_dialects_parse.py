@@ -17,21 +17,22 @@ Parser tests for the KTIR dialect layer and module-level parser.
 
 Covers:
 - Module/function-level parser (moved from test_ktir_cpu.py)
-- arith dialect parsers: arith.constant, arith.cmpi, arith.sitofp
+- arith dialect parsers: arith.constant, arith.cmpi, arith.cmpf, arith.sitofp
 - linalg dialect parsers: linalg.reduce, linalg.fill, linalg.broadcast
 - tensor dialect parsers: tensor.empty, tensor.splat, tensor.extract, tensor.expand_shape
 - ktdp dialect parsers: ktdp.get_compute_tile_id, ktdp.construct_memory_view,
                          ktdp.construct_access_tile
 - scf dialect parsers: scf.for, scf.yield
+- math dialect parsers: math.exp, math.sqrt, math.rsqrt, math.log, math.log2,
+                         math.log1p, math.tanh, math.sin, math.cos, math.absf,
+                         math.absi, math.ceil, math.floor, math.erf, math.powf,
+                         math.fma
 
 Design rule
 -----------
-The goal of the regex parser is to parse valid MLIR.  All op text examples
-in this file must therefore be valid MLIR.  Non-MLIR syntax forces the
-corresponding test_parse_adapt.py test to be skipped, which defeats the
-purpose of sharing tests between the two parser backends.
-
-All op text examples have been verified to parse with both backends.
+All op text examples in this file must be valid MLIR so that the tests are
+fully portable to the MLIRFrontendParser backend in test_parse_adapt.py.
+All op examples have been verified to parse with both backends.
 """
 
 import numpy as np
@@ -252,6 +253,62 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "shape", (4,))
         self.assert_attribute(op, "dtype", "f16")
 
+    @pytest.mark.parametrize("op_name", [
+        "arith.addi", "arith.subi", "arith.muli",
+        "arith.divsi", "arith.divui",
+        "arith.remsi", "arith.remui",
+        "arith.ceildivsi", "arith.floordivsi",
+        "arith.minsi", "arith.maxsi",
+        "arith.minui", "arith.maxui",
+        "arith.andi", "arith.ori", "arith.xori",
+        "arith.shli", "arith.shrsi", "arith.shrui",
+    ])
+    def test_int_binop(self, op_name):
+        op = self._parse(
+            f"%r = {op_name} %a, %b : i32",
+            args={"%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 2)
+
+    @pytest.mark.parametrize("op_name", [
+        "arith.extsi", "arith.extui", "arith.trunci",
+        "arith.fptosi", "arith.fptoui",
+        "arith.uitofp",
+    ])
+    def test_int_cast(self, op_name):
+        type_map = {
+            "arith.extsi":  ("i16", "i32"),
+            "arith.extui":  ("i16", "i32"),
+            "arith.trunci": ("i32", "i16"),
+            "arith.fptosi": ("f32", "i32"),
+            "arith.fptoui": ("f32", "i32"),
+            "arith.uitofp": ("i32", "f32"),
+        }
+        src_type, dst_type = type_map[op_name]
+        op = self._parse(
+            f"%r = {op_name} %a : {src_type} to {dst_type}",
+            args={"%a": src_type},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+
+    def test_index_cast(self):
+        op = self._parse(
+            "%r = arith.index_cast %a : i32 to index",
+            args={"%a": "i32"},
+        )
+        self.assert_op_type(op, "arith.index_cast")
+        self.assert_num_operands(op, 1)
+
+    def test_select(self):
+        op = self._parse(
+            "%r = arith.select %cond, %a, %b : i32",
+            args={"%cond": "i1", "%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, "arith.select")
+        self.assert_num_operands(op, 3)
+
     def test_cmpi_basic(self):
         # cmpi records predicate and both operands
         op = self._parse(
@@ -283,7 +340,8 @@ class TestArithParsers(ParseTestMixin):
         self.assert_operand_names(op, "%i")
         self.assert_result_type(op, "f16")
 
-    def test_cmpf_olt(self):
+    def test_cmpf_basic(self):
+        # cmpf records predicate and both operands
         op = self._parse(
             "%r = arith.cmpf olt, %a, %b : f16",
             args={"%a": "f16", "%b": "f16"},
@@ -302,6 +360,16 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "predicate", "uge")
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%y")
+
+    def test_cmpf_all_ordered_predicates(self):
+        # all ordered, unordered, and always-true/false predicates are recognised
+        for pred in ("false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord",
+                     "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true"):
+            op = self._parse(
+                f"%b = arith.cmpf {pred}, %x, %y : f32",
+                args={"%x": "f32", "%y": "f32"},
+            )
+            self.assert_attribute(op, "predicate", pred)
 
     def test_cmpf_missing_predicate_raises(self):
         # regex parser raises ValueError; MLIR frontend raises MLIRError
