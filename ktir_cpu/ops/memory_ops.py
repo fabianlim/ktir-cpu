@@ -30,30 +30,36 @@ from ..memory import HBMSimulator
 
 
 class _MemAccessor:
-    """Resolves a (context, memref, byte_addr) triple into simulator read/write calls.
+    """Resolves a (context, memory_space, byte_addr) triple into simulator
+    read/write calls.
 
     This is the single place in the codebase that manages the intra-stick byte
-    offset abstraction: HBMSimulator requires a (stick, intra_byte) address pair
-    while LXScratchpad uses a plain byte address.  ``MemRef.split_addr`` produces
-    the pair; this class captures it and forwards any extra address kwargs to the
-    underlying simulator so callers never handle them directly.
+    offset abstraction: HBMSimulator requires a (stick, intra_byte) address
+    pair while LXScratchpad uses a plain byte address.  The accessor consumes
+    only ``memory_space`` (for simulator dispatch) and an absolute
+    ``byte_addr``; the byte_addr must live in physical memory matching the
+    given memory_space.  Callers do not need to manufacture a MemRef.
 
-    ``stick_bytes`` is exposed for callers that need to count distinct HBM sticks
-    touched by an access (latency accounting); it is None for LX.
+    ``stick_bytes`` is exposed for callers that need to count distinct HBM
+    sticks touched by an access (latency accounting); it is None for LX.
 
-    To extend to a new memory space, add a branch in ``__init__`` that populates
-    ``_args`` and ``_kwargs`` appropriately — ``read`` and ``write`` require no
-    changes.
+    To extend to a new memory space, add a branch in ``__init__`` that
+    populates ``_args`` and ``_kwargs`` appropriately — ``read`` and ``write``
+    require no changes.
     """
 
-    def __init__(self, context: CoreContext, memref: MemRef, byte_addr: int):
-        _main, _intra = memref.split_addr(byte_addr)
-        self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES if memref.memory_space == "HBM" else None
-        self._sim = context.hbm if memref.memory_space == "HBM" else context.lx
-        self._args = (_main,)
-        self._kwargs = {}
-        if memref.memory_space == "HBM":
-            self._kwargs["intra_byte"] = _intra
+    def __init__(self, context: CoreContext, memory_space: str, byte_addr: int):
+        if memory_space == "HBM":
+            self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES
+            self._sim = context.hbm
+            stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
+            self._args = (stick,)
+            self._kwargs = {"intra_byte": intra}
+        else:
+            self.stick_bytes = None
+            self._sim = context.lx
+            self._args = (byte_addr,)
+            self._kwargs = {}
 
     def read(self, n: int, dtype: str) -> np.ndarray:
         return self._sim.read(*self._args, n, dtype, **self._kwargs)
@@ -244,7 +250,7 @@ class MemoryOps:
         Returns:
             Tile value (tensor) loaded into LX
         """
-        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
+        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr)
         stick_bytes = mgr.stick_bytes
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
@@ -303,7 +309,7 @@ class MemoryOps:
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
         """
-        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
+        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
@@ -353,7 +359,7 @@ class MemoryOps:
                     )
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
                     addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
-                    raw = _MemAccessor(context, idx_view, addr).read(1, idx_view.dtype)
+                    raw = _MemAccessor(context, idx_view.memory_space, addr).read(1, idx_view.dtype)
                     coord.append(int(raw[0]))
                 elif sub["kind"] == "direct":
                     coord.append(pt[sub["var_index"]])
