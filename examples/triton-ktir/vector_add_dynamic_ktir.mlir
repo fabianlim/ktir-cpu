@@ -1,3 +1,7 @@
+// #set bounds the memory view to n_elements (symbolic s0); elements outside
+// this range are masked on load and ignored on store — matching tensor_descriptor
+// semantics. The access tile (#set1) is fixed at 1024; when n_elements < 1024
+// the out-of-bounds positions are masked rather than triggering an error.
 #map = affine_map<(d0) -> (d0)>
 #set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>
 #set1 = affine_set<(d0) : (d0 >= 0, -d0 + 1023 >= 0)>
