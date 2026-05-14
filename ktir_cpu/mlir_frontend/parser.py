@@ -171,6 +171,8 @@ MLIRTypeAdapter.install(
     "arith.divsi", "arith.divui",
     "arith.ceildivsi", "arith.floordivsi",
     "arith.remsi", "arith.remui",
+    "arith.minsi", "arith.maxsi",
+    "arith.minui", "arith.maxui",
     # integer bitwise
     "arith.andi", "arith.ori", "arith.xori",
     "arith.shli", "arith.shrsi", "arith.shrui",

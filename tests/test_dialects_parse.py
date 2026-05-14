@@ -253,6 +253,62 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "shape", (4,))
         self.assert_attribute(op, "dtype", "f16")
 
+    @pytest.mark.parametrize("op_name", [
+        "arith.addi", "arith.subi", "arith.muli",
+        "arith.divsi", "arith.divui",
+        "arith.remsi", "arith.remui",
+        "arith.ceildivsi", "arith.floordivsi",
+        "arith.minsi", "arith.maxsi",
+        "arith.minui", "arith.maxui",
+        "arith.andi", "arith.ori", "arith.xori",
+        "arith.shli", "arith.shrsi", "arith.shrui",
+    ])
+    def test_int_binop(self, op_name):
+        op = self._parse(
+            f"%r = {op_name} %a, %b : i32",
+            args={"%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 2)
+
+    @pytest.mark.parametrize("op_name", [
+        "arith.extsi", "arith.extui", "arith.trunci",
+        "arith.fptosi", "arith.fptoui",
+        "arith.uitofp",
+    ])
+    def test_int_cast(self, op_name):
+        type_map = {
+            "arith.extsi":  ("i16", "i32"),
+            "arith.extui":  ("i16", "i32"),
+            "arith.trunci": ("i32", "i16"),
+            "arith.fptosi": ("f32", "i32"),
+            "arith.fptoui": ("f32", "i32"),
+            "arith.uitofp": ("i32", "f32"),
+        }
+        src_type, dst_type = type_map[op_name]
+        op = self._parse(
+            f"%r = {op_name} %a : {src_type} to {dst_type}",
+            args={"%a": src_type},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+
+    def test_index_cast(self):
+        op = self._parse(
+            "%r = arith.index_cast %a : i32 to index",
+            args={"%a": "i32"},
+        )
+        self.assert_op_type(op, "arith.index_cast")
+        self.assert_num_operands(op, 1)
+
+    def test_select(self):
+        op = self._parse(
+            "%r = arith.select %cond, %a, %b : i32",
+            args={"%cond": "i1", "%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, "arith.select")
+        self.assert_num_operands(op, 3)
+
     def test_cmpi_basic(self):
         # cmpi records predicate and both operands
         op = self._parse(
