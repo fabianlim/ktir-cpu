@@ -362,17 +362,9 @@ class TestArithParsers(ParseTestMixin):
         self.assert_operand_names(op, "%x", "%y")
 
     def test_cmpf_all_ordered_predicates(self):
-        # all ordered float comparison predicates are recognised
-        for pred in ("oeq", "ogt", "oge", "olt", "ole", "one", "ord"):
-            op = self._parse(
-                f"%b = arith.cmpf {pred}, %x, %y : f32",
-                args={"%x": "f32", "%y": "f32"},
-            )
-            self.assert_attribute(op, "predicate", pred)
-
-    def test_cmpf_unordered_predicates(self):
-        # all unordered float comparison predicates are recognised
-        for pred in ("ueq", "ugt", "uge", "ult", "ule", "une", "uno"):
+        # all ordered, unordered, and always-true/false predicates are recognised
+        for pred in ("false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord",
+                     "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true"):
             op = self._parse(
                 f"%b = arith.cmpf {pred}, %x, %y : f32",
                 args={"%x": "f32", "%y": "f32"},

@@ -589,7 +589,7 @@ def parse_arith_cmpf(op_text, parse_ctx):
     result_name = result_match.group(1)
 
     pred_match = re.search(
-        r'arith\.cmpf\s+(oeq|ogt|oge|olt|ole|one|ord|ueq|ugt|uge|ult|ule|une|uno)', op_text)
+        r'arith\.cmpf\s+(true|false|oeq|ogt|oge|olt|ole|one|ord|ueq|ugt|uge|ult|ule|une|uno)', op_text)
     if not pred_match:
         raise ValueError(f"arith.cmpf: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
