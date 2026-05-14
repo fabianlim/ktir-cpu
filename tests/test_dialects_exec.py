@@ -1094,7 +1094,7 @@ class TestKtdp:
                      result=["%x", "%y"]) == (2, 1)
 
     def test_construct_memory_view(self):
-        # creates a TileRef pointing at the given pointer with the given shape
+        # creates a MemRef pointing at the given pointer with the given shape
         hbm = HBMSimulator()
         ptr = hbm.allocate(256 * 2)
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
@@ -1109,7 +1109,7 @@ class TestKtdp:
 
     def test_load_store_roundtrip(self):
         # load reads data from HBM; store writes it back modified
-        from ktir_cpu.ir_types import AccessTile, TileRef
+        from ktir_cpu.ir_types import AccessTile, MemRef
         from ktir_cpu.parser_ast import parse_affine_map
 
         hbm = HBMSimulator()
@@ -1120,8 +1120,9 @@ class TestKtdp:
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
         identity_map = parse_affine_map("affine_map<(d0) -> (d0)>")
-        tile_ref = TileRef(base_ptr=ptr, shape=(8,), strides=[1],
-                           memory_space="HBM", dtype="f16")
+        memref = MemRef(base_ptr=ptr, shape=(8,), strides=[1],
+                        memory_space="HBM", dtype="f16")
+        tile_ref = memref.to_tile_ref()
         access_tile = AccessTile(parent_ref=tile_ref, shape=(8,),
                                  base_map=identity_map,
                                  coordinate_set=None,
