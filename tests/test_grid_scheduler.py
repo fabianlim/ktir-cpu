@@ -12,261 +12,417 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scheduler correctness tests for GridExecutor._run_scheduler / execute_with_communication.
+"""Scheduler tests for ``GridExecutor.execute_with_communication``.
 
-Test harness
-------------
-Scripts describe per-core execution as a list of steps:
+What is under test
+------------------
+The scheduler primitives (message queue, generator driving, deadlock
+detection) and ``CommOps`` algorithms together. ``CommOps.reduce`` is
+the multi-yield generator path — it implements ring reduction and
+yields ``N-1`` ``RecvRequest``s per core. Tests exercise the round
+trip::
 
-    ("sync",  value)          -- return *value* immediately (no blocking)
-    ("send",  dst, tile)      -- enqueue *tile* to *dst*, continue
-    ("recv",  src)            -- block until a tile arrives from *src*
-    ("loop",  n, body_steps)  -- repeat body_steps n times (simulates scf.for)
+    test.reduce op
+      → stub handler  (this file)
+      → CommOps.reduce (yields RecvRequest(prev) N-1 times)
+      → CoreExecutionStack._execute_until_block (yield from)
+      → GridExecutor scheduler loop
+      → message delivery
+      → resume with received tile
 
-``build_ops(scripts)`` translates a dict[core_id -> steps] into
-(operations, execute_op) ready for GridExecutor.execute_with_communication.
-The returned *operations* is a list of one sentinel FakeOp per step;
-*execute_op* dispatches on op index and core_id.
+What is *not* under test
+------------------------
+The dialect / interpreter dispatch path. Tests do not go through
+``KTIRInterpreter`` or the global op registry. The experimental
+``ktdp.transfer`` / ``ktdp.reduce`` ops are out of scope; tests speak
+directly to ``CommOps``, which is the stable per-core comm surface.
 
-This lets tests express complex multi-core, multi-round, nested-loop
-communication patterns without touching the parser or interpreter.
+Scaffold design — three layers
+------------------------------
+A test is a **declarative spec**: grid shape, per-core seed tiles, a
+shared op list (broadcast to all cores), and per-core expected results.
+The scaffold has three layers; each layer has one job and is replaceable
+in isolation.
+
+1. **Spec** (module-level dicts like ``SPEC_RING_REDUCE_FOUR``).
+   Pure data. Describes *what* the test wants without saying *how* to
+   run it. Adding a test = writing a spec dict and a one-line test
+   function calling ``run_spec``.
+
+2. **Harness** (``initialize_ops``, ``seed_tiles``, ``check_expectations``,
+   ``build_grid``, ``run_spec``).
+   Translates a spec into runtime actions: builds ``Operation`` objects
+   from op-descriptor dicts, seeds tiles into core scopes, drives the
+   scheduler, asserts post-conditions. Knows nothing about which ops
+   exist — handlers are looked up at runtime by ``op_type``.
+
+3. **Stub handlers** (``_h_reduce``, ``_STUB_HANDLERS``, ``execute_fn``).
+   The minimal ``execute_op`` the scheduler needs. Looks up an op by
+   ``op_type``, calls a handler that returns either a value (plain op)
+   or a generator (blocking op). Mirrors the bind-result / track-LX
+   logic of ``KTIRInterpreter.execute_op`` for plain returns; for
+   generator returns hands off to the scheduler unchanged.
+
+   Adding a new comm primitive to test = add one handler and one entry
+   to ``_STUB_HANDLERS``. No registry, no fixture patching.
+
+Why this shape
+~~~~~~~~~~~~~~
+- **Spec is data, not code.** Lets tests communicate intent at a glance
+  and makes the failure mode (which value disagrees) localized.
+- **Harness is generic.** One implementation; every test calls
+  ``run_spec(SPEC, execute_fn)``.
+- **Stub handlers are the smallest seam to ``CommOps``.** They route an
+  ``Operation`` to a ``CommOps`` call and propagate the result. They
+  are not ops themselves and have no semantics beyond "call this
+  ``CommOps`` function with these arguments."
+
+Spec format
+-----------
+::
+
+    {
+        "grid":       (nx, ny, nz),
+        "seed":       {core_id: {ssa_name: Tile}},
+        "operations": [{"op": str, "args": [str], "attrs": {...},
+                        "result": str}],
+        "expect":     {core_id: {ssa_name: scalar}},
+    }
+
+- ``grid``: passed to ``GridExecutor`` (number of cores = product).
+- ``seed``: tiles bound into each core's scope before the scheduler runs.
+- ``operations``: same list runs on every core (broadcast). Per-core
+  variation comes from ``CommOps`` primitives that self-select via
+  attributes (e.g. ``group``).
+- ``expect``: each named tile's ``data[0]`` must match the scalar
+  (within ``pytest.approx`` tolerance).
+
+Ring reduction (recap)
+----------------------
+Cores in ``core_group`` form a logical ring in list order. Each core
+runs ``N-1`` rounds. Per round it forwards the tile it just received
+(round 1: its own starting tile) to the next neighbor and folds the
+incoming tile into its local accumulator. After ``N-1`` rounds every
+participating core holds the full reduction. See ``CommOps.reduce`` for
+a worked example.
+
+For a 4-core sum of ``[1, 2, 3, 4]``, every core ends with ``10``. For
+``N=2``, exactly one round runs and both cores end with ``a + b``. The
+two tests below cover these cases.
+
+See also
+--------
+- ``docs/cross_core_scheduling.md`` — scheduler protocol, layer roles.
+- ``PLAN_test_grid.md`` — design rationale for this harness.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, List, Optional, Tuple
+import inspect
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pytest
 
-from ktir_cpu.grid import GridExecutor, RecvRequest
-from ktir_cpu.ir_types import Tile
+from ktir_cpu.grid import GridExecutor
+from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.memory import SpyreMemoryHierarchy
+from ktir_cpu.ops.comm_ops import CommOps
 
 
 # ---------------------------------------------------------------------------
-# Harness types
+# Tile helpers
+# ---------------------------------------------------------------------------
+# Tiny utilities for constructing the data values that flow through the
+# scheduler. Tests only need scalar values to verify reduction
+# correctness, so every tile is shape (1,) float16. Element-wise sum is
+# the only reduction function exercised today; add more here when a new
+# spec needs a different ``reduce_fn`` (max, mean, …).
 # ---------------------------------------------------------------------------
 
-Step = Tuple  # one of the tuples described above
-
-def _tile(val: float) -> Tile:
-    return Tile(np.array([val], dtype=np.float16), "f16", (1,))
-
-
-def _run_script(core, steps: List[Step], log: List):
-    """Generator that executes a core's step list, yielding RecvRequests."""
-    for step in steps:
-        kind = step[0]
-        if kind == "sync":
-            log.append(("sync", core.core_id, step[1]))
-        elif kind == "send":
-            _, dst, tile = step
-            core.send_to(dst, tile)
-            log.append(("send", core.core_id, dst, tile.data[0]))
-        elif kind == "recv":
-            _, src = step
-            tile = yield RecvRequest(src=src)
-            log.append(("recv", core.core_id, src, tile.data[0]))
-        elif kind == "loop":
-            _, n, body = step
-            for _ in range(n):
-                yield from _run_script(core, body, log)
-        else:
-            raise ValueError(f"Unknown step kind: {kind!r}")
+def _tile(value: float) -> Tile:
+    """Build a 1-element float16 tile holding ``value``."""
+    return Tile(np.array([value], dtype=np.float16), "f16", (1,))
 
 
-class _FakeOp:
-    """Minimal op-like object for the scheduler harness."""
-    op_type = "test.script"
-    result = None
-    operands: List[str] = field(default_factory=list)
-
-    def __init__(self):
-        self.operands = []
-
-
-def build_grid(num_cores: int) -> GridExecutor:
-    mem = SpyreMemoryHierarchy(num_cores=num_cores)
-    return GridExecutor(grid_shape=(num_cores, 1, 1), memory=mem)
-
-
-def run_scripts(
-    grid: GridExecutor,
-    scripts: Dict[int, List[Step]],
-) -> List:
-    """Run *scripts* on *grid*, return the event log in arrival order."""
-    log: List = []
-    sentinel = _FakeOp()
-
-    def execute_op(op, context):
-        steps = scripts.get(context.core_id, [])
-        gen = _run_script(context, steps, log)
-        # Peek: if the generator has nothing to yield, exhaust it and return.
-        try:
-            first = next(gen)
-            # It yielded — return a generator that re-yields first then continues.
-            def _replay():
-                tile = yield first
-                try:
-                    while True:
-                        tile = yield gen.send(tile)
-                except StopIteration:
-                    pass
-            return _replay()
-        except StopIteration:
-            return None
-
-    grid.execute_with_communication([sentinel], {}, execute_op)
-    return log
+def _sum_tiles(a: Tile, b: Tile) -> Tile:
+    """Element-wise float16 add — the reduction function used by tests."""
+    return Tile(
+        np.array(a.data + b.data, dtype=np.float16),
+        "f16",
+        a.shape,
+    )
 
 
 # ---------------------------------------------------------------------------
-# 1. Single cross-core send/recv (no loops)
+# Stub handlers — keyed by op_type
+# ---------------------------------------------------------------------------
+# Each handler is the minimal bridge between an ``Operation`` (data) and
+# a ``CommOps`` call (behavior). It pulls operands and attributes off the
+# op, calls a ``CommOps`` primitive, and returns whatever the primitive
+# returned — a value (plain op) or a generator (blocking op). The
+# scheduler does the rest:
+#
+#   - plain return → ``execute_fn`` binds it to ``op.result``.
+#   - generator    → scheduler drives it via ``yield from``, parking the
+#                    core on each ``RecvRequest`` until a tile arrives.
+#
+# Handlers do NOT register into ``ktir_cpu.dialects.registry``. The stub
+# ``execute_fn`` looks them up directly in ``_STUB_HANDLERS``. This keeps
+# tests isolated from the global registry and from any dialect-level
+# changes.
+#
+# Adding a new comm primitive to test = (1) write a handler that calls
+# the relevant ``CommOps`` function, (2) add an entry to
+# ``_STUB_HANDLERS``. No registry, no fixture patching.
 # ---------------------------------------------------------------------------
 
-def test_single_region_send_recv():
-    """Core 0 sends a tile to core 1; core 1 receives it."""
-    grid = build_grid(2)
-    t = _tile(42.0)
-    log = run_scripts(grid, {
-        0: [("send", 1, t)],
-        1: [("recv", 0)],
-    })
-    sends  = [e for e in log if e[0] == "send"]
-    recvs  = [e for e in log if e[0] == "recv"]
-    assert len(sends) == 1 and sends[0][3] == 42.0
-    assert len(recvs) == 1 and recvs[0][3] == 42.0
+def _h_reduce(op: Operation, ctx) -> Any:
+    """test.reduce — wraps CommOps.reduce (ring reduction, per-core view).
+
+    Returns the generator produced by ``CommOps.reduce``. The scheduler
+    drives ``N-1`` ``RecvRequest`` yields per core; the final accumulator
+    is bound to ``op.result``.
+    """
+    tile = ctx.get_value(op.operands[0])
+    group = op.attributes["group"]
+    return CommOps.reduce(ctx, tile, group, _sum_tiles)
 
 
-def test_bidirectional_exchange():
-    """Both cores send to each other simultaneously — no deadlock."""
-    grid = build_grid(2)
-    log = run_scripts(grid, {
-        0: [("send", 1, _tile(1.0)), ("recv", 1)],
-        1: [("send", 0, _tile(2.0)), ("recv", 0)],
-    })
-    recvs = {e[1]: e[3] for e in log if e[0] == "recv"}
-    assert recvs[0] == 2.0  # core 0 received from core 1
-    assert recvs[1] == 1.0  # core 1 received from core 0
-
-
-# ---------------------------------------------------------------------------
-# 2. Single scf.for across cores — recv inside the loop body
-# ---------------------------------------------------------------------------
-
-def test_single_scf_for_recv_in_loop():
-    """Core 0 sends 3 tiles one per iteration; core 1 receives each inside the loop."""
-    N = 3
-    grid = build_grid(2)
-    log = run_scripts(grid, {
-        0: [("loop", N, [("send", 1, _tile(float(i))) for i in range(N)])],
-        1: [("loop", N, [("recv", 0)])],
-    })
-    recvs = [e[3] for e in log if e[0] == "recv"]
-    assert recvs == [0.0, 1.0, 2.0]
+_STUB_HANDLERS: Dict[str, Callable[[Operation, Any], Any]] = {
+    "test.reduce": _h_reduce,
+}
 
 
 # ---------------------------------------------------------------------------
-# 3. Double scf.for — recv inside the inner loop
+# Stub execute_op — minimal replacement for KTIRInterpreter.execute_op
+# ---------------------------------------------------------------------------
+# ``execute_with_communication`` calls back into an ``execute_op`` for
+# every op a core encounters. Production passes
+# ``KTIRInterpreter.execute_op``; tests pass this stub.
+#
+# What the stub does
+# ~~~~~~~~~~~~~~~~~~
+# 1. Look up a handler in ``_STUB_HANDLERS`` keyed by ``op.op_type``.
+# 2. Call the handler.
+# 3. If the handler returned a generator, hand it back to the scheduler
+#    unchanged — the scheduler's ``yield from`` will drive it through
+#    every ``RecvRequest`` and collect the final return value.
+# 4. Otherwise treat the return value as the op's result: bind it to
+#    ``op.result`` in the core's scope and (for tiles) charge LX. This
+#    mirrors the post-op handling in ``KTIRInterpreter.execute_op`` so a
+#    handler returning a tile behaves identically in either harness.
+#
+# What the stub does NOT do
+# ~~~~~~~~~~~~~~~~~~~~~~~~~
+# Anything else ``KTIRInterpreter.execute_op`` does — region descent,
+# latency tracking, dialect-specific pre-processing, error wrapping. The
+# stub is deliberately the smallest piece of code that lets the
+# scheduler call back into a comm-aware handler.
+#
+# Exposed as a fixture so individual tests can override (e.g. to inject
+# tracing or fault injection) without touching the harness.
 # ---------------------------------------------------------------------------
 
-def test_double_scf_for_recv_in_inner_loop():
-    """Nested loops: core 0 sends outer*inner tiles; core 1 receives in the inner loop."""
-    OUTER, INNER = 2, 3
-    grid = build_grid(2)
-    log = run_scripts(grid, {
-        0: [("loop", OUTER, [
-                ("loop", INNER, [("send", 1, _tile(1.0))])
-            ])],
-        1: [("loop", OUTER, [
-                ("loop", INNER, [("recv", 0)])
-            ])],
-    })
-    recvs = [e for e in log if e[0] == "recv"]
-    assert len(recvs) == OUTER * INNER
+@pytest.fixture
+def execute_fn() -> Callable[[Operation, Any], Any]:
+    """Dispatch by op_type to a handler in ``_STUB_HANDLERS``.
 
-
-# ---------------------------------------------------------------------------
-# 4. Double scf.for — recv inside the outer loop only (inner is sync)
-# ---------------------------------------------------------------------------
-
-def test_double_scf_for_recv_in_outer_loop():
-    """Blocking recv in outer loop; inner loop is all sync work."""
-    OUTER, INNER = 3, 4
-    grid = build_grid(2)
-    log = run_scripts(grid, {
-        0: [("loop", OUTER, [
-                ("send", 1, _tile(1.0)),
-                ("loop", INNER, [("sync", None)]),
-            ])],
-        1: [("loop", OUTER, [
-                ("recv", 0),
-                ("loop", INNER, [("sync", None)]),
-            ])],
-    })
-    recvs = [e for e in log if e[0] == "recv"]
-    assert len(recvs) == OUTER
-
-
-# ---------------------------------------------------------------------------
-# 5. Deadlock detection — flat (no loops)
-# ---------------------------------------------------------------------------
-
-def test_deadlock_flat():
-    """Both cores wait on each other with no sends — deadlock detected."""
-    grid = build_grid(2)
-    with pytest.raises(RuntimeError, match="Deadlock detected"):
-        run_scripts(grid, {
-            0: [("recv", 1)],
-            1: [("recv", 0)],
-        })
-
-
-# ---------------------------------------------------------------------------
-# 6. Deadlock detection — inside a loop
-# ---------------------------------------------------------------------------
-
-def test_deadlock_inside_loop():
-    """Core 0 sends once then waits; core 1 waits twice — deadlock on second recv."""
-    grid = build_grid(2)
-    with pytest.raises(RuntimeError, match="Deadlock detected"):
-        run_scripts(grid, {
-            0: [("send", 1, _tile(1.0)), ("recv", 1)],  # sends once, then waits — never gets reply
-            1: [("recv", 0), ("recv", 0)],              # receives once, then waits for a second send that never comes
-        })
-
-
-# ---------------------------------------------------------------------------
-# 7. 4-core ring reduce (N-1 rounds)
-# ---------------------------------------------------------------------------
-
-def test_ring_reduce_4cores():
-    """4-core ring: each core holds a value, N-1 rounds of send+recv accumulate the sum."""
-    N = 4
-    grid = build_grid(N)
-    initial = {i: float(i + 1) for i in range(N)}  # [1, 2, 3, 4]
-    accumulated = {i: initial[i] for i in range(N)}
-    recv_log: Dict[int, List[float]] = {i: [] for i in range(N)}
-
-    def scripts():
-        result = {}
-        for core_id in range(N):
-            steps = []
-            for _ in range(N - 1):
-                next_core = (core_id + 1) % N
-                prev_core = (core_id - 1) % N
-                steps.append(("send", next_core, _tile(initial[core_id])))
-                steps.append(("recv", prev_core))
-            result[core_id] = steps
+    Mirrors the bind-result/track-LX logic of
+    ``KTIRInterpreter.execute_op`` for plain returns; for generator
+    returns, hands off to the scheduler (which drives via ``yield from``).
+    """
+    def _execute(op: Operation, ctx) -> Any:
+        handler = _STUB_HANDLERS.get(op.op_type)
+        if handler is None:
+            raise KeyError(f"No stub handler for op_type {op.op_type!r}")
+        result = handler(op, ctx)
+        if inspect.isgenerator(result):
+            return result
+        if op.result and result is not None:
+            ctx.set_value(op.result, result)
+            if isinstance(result, Tile):
+                ctx.track_lx(op.result, result.size_bytes())
         return result
+    return _execute
 
-    log = run_scripts(grid, scripts())
-    recvs_per_core = {}
-    for e in log:
-        if e[0] == "recv":
-            recvs_per_core.setdefault(e[1], []).append(e[3])
 
-    for core_id in range(N):
-        assert len(recvs_per_core[core_id]) == N - 1
+# ---------------------------------------------------------------------------
+# Harness
+# ---------------------------------------------------------------------------
+# Generic translation from a spec dict (data) to runtime actions
+# (behavior). The harness knows nothing about which ops or handlers
+# exist — handler lookup happens at runtime in ``execute_fn`` via
+# ``op.op_type``. Tests interact with the harness through ``run_spec``;
+# the smaller helpers are exposed for tests that want to drive parts
+# of the flow individually (e.g. for custom assertions on intermediate
+# state).
+#
+# Pipeline
+# ~~~~~~~~
+#   spec ──▶ build_grid       — fresh GridExecutor from spec["grid"]
+#        ──▶ initialize_ops   — op-descriptor dicts → Operation objects
+#        ──▶ seed_tiles       — bind tiles into each core's scope
+#        ──▶ execute_with_communication(ops, {}, execute_fn)
+#        ──▶ check_expectations — assert per-core post-conditions
+# ---------------------------------------------------------------------------
+
+def build_grid(shape: Tuple[int, int, int]) -> GridExecutor:
+    n = shape[0] * shape[1] * shape[2]
+    return GridExecutor(grid_shape=shape, memory=SpyreMemoryHierarchy(num_cores=n))
+
+
+def initialize_ops(op_descs: List[dict]) -> List[Operation]:
+    """Convert spec op-descriptor dicts to Operation objects."""
+    return [
+        Operation(
+            result=desc.get("result"),
+            op_type=desc["op"],
+            operands=desc.get("args", []),
+            attributes=desc.get("attrs", {}),
+            result_type=desc.get("result_type", "tile"),
+            regions=[],
+        )
+        for desc in op_descs
+    ]
+
+
+def seed_tiles(grid: GridExecutor, seed: Dict[int, Dict[str, Tile]]) -> None:
+    for core_id, values in seed.items():
+        for name, tile in values.items():
+            grid.cores[core_id].set_value(name, tile)
+
+
+def check_expectations(grid: GridExecutor,
+                       expect: Dict[int, Dict[str, float]]) -> None:
+    for core_id, values in expect.items():
+        for name, expected in values.items():
+            tile = grid.cores[core_id].get_value(name)
+            actual = float(tile.data[0])
+            assert actual == pytest.approx(expected), (
+                f"core {core_id} {name}: expected {expected}, got {actual}"
+            )
+
+
+def run_spec(spec: dict, execute_fn) -> GridExecutor:
+    grid = build_grid(spec["grid"])
+    ops = initialize_ops(spec["operations"])
+    seed_tiles(grid, spec["seed"])
+    grid.execute_with_communication(ops, {}, execute_fn)
+    check_expectations(grid, spec["expect"])
+    return grid
+
+
+# ---------------------------------------------------------------------------
+# Specs
+# ---------------------------------------------------------------------------
+# Module-level test specs — pure data describing what each test exercises.
+# Each spec is a plain dict matching the format documented in the module
+# docstring. A test reads as: pick a spec, run it, check expectations.
+#
+# Multi-group specs broadcast multiple ``test.reduce`` ops to every
+# core. ``CommOps.reduce`` checks ``ctx.core_id in group`` and returns
+# the input tile unchanged for non-participants, so a core that appears
+# in only one group's reduction simply no-ops on the other ops. That is
+# why every core must have ``%t`` bound — the broadcast op references it
+# even when the core does not participate.
+# ---------------------------------------------------------------------------
+
+SPEC_RING_REDUCE_2_CORES = {
+    "grid": (2, 1, 1),
+    "seed": {
+        0: {"%t": _tile(5.0)},
+        1: {"%t": _tile(7.0)},
+    },
+    "operations": [
+        {"op": "test.reduce", "args": ["%t"],
+         "attrs": {"group": [0, 1]}, "result": "%r"},
+    ],
+    "expect": {
+        0: {"%r": 12.0},
+        1: {"%r": 12.0},
+    },
+}
+
+
+SPEC_RING_REDUCE_4_CORES = {
+    "grid": (4, 1, 1),
+    "seed": {
+        0: {"%t": _tile(1.0)},
+        1: {"%t": _tile(2.0)},
+        2: {"%t": _tile(3.0)},
+        3: {"%t": _tile(4.0)},
+    },
+    "operations": [
+        {"op": "test.reduce", "args": ["%t"],
+         "attrs": {"group": [0, 1, 2, 3]}, "result": "%r"},
+    ],
+    "expect": {
+        # After N-1=3 ring rounds, every participating core holds the full sum.
+        0: {"%r": 10.0},
+        1: {"%r": 10.0},
+        2: {"%r": 10.0},
+        3: {"%r": 10.0},
+    },
+}
+
+
+# 4x4 grid, four concurrent ring reductions along rows.
+# Linear id = y * 4 + x. Row y = [4y, 4y+1, 4y+2, 4y+3].
+# Each row sums [1, 2, 3, 4] = 10.
+#
+# Each row gets its own result name (%r0..%r3) so that a core that
+# only participates in row y has only %r{y} checked. Non-participants
+# still return their input tile via ``CommOps.reduce``, but the spec
+# never asserts on those values.
+SPEC_RING_REDUCE_4X4_ROWS = {
+    "grid": (4, 4, 1),
+    "seed": {core_id: {"%t": _tile(float((core_id % 4) + 1))}
+             for core_id in range(16)},
+    "operations": [
+        {"op": "test.reduce", "args": ["%t"],
+         "attrs": {"group": [4 * y + x for x in range(4)]},
+         "result": f"%r{y}"}
+        for y in range(4)
+    ],
+    "expect": {core_id: {f"%r{core_id // 4}": 10.0} for core_id in range(16)},
+}
+
+
+# 4x4 grid, four concurrent ring reductions along columns.
+# Column x = [x, x+4, x+8, x+12]. Each column sums [1, 2, 3, 4] = 10.
+# Each column gets its own result name (%c0..%c3); see the row spec for
+# the rationale on per-group result names.
+SPEC_RING_REDUCE_4X4_COLS = {
+    "grid": (4, 4, 1),
+    "seed": {core_id: {"%t": _tile(float((core_id // 4) + 1))}
+             for core_id in range(16)},
+    "operations": [
+        {"op": "test.reduce", "args": ["%t"],
+         "attrs": {"group": [4 * y + x for y in range(4)]},
+         "result": f"%c{x}"}
+        for x in range(4)
+    ],
+    "expect": {core_id: {f"%c{core_id % 4}": 10.0} for core_id in range(16)},
+}
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+# One parametrized test, one entry per spec. Adding coverage = define a
+# spec above and add it to the parametrize list with a readable id.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(SPEC_RING_REDUCE_2_CORES, id="2_cores"),
+        pytest.param(SPEC_RING_REDUCE_4_CORES, id="4_cores"),
+        pytest.param(SPEC_RING_REDUCE_4X4_ROWS, id="4x4_rows"),
+        pytest.param(SPEC_RING_REDUCE_4X4_COLS, id="4x4_cols"),
+    ],
+)
+def test_ring_reduce(spec, execute_fn):
+    """Ring reduction across one or more disjoint groups."""
+    run_spec(spec, execute_fn)
