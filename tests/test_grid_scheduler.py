@@ -328,7 +328,7 @@ def run_spec(spec: dict, execute_fn) -> GridExecutor:
 # even when the core does not participate.
 # ---------------------------------------------------------------------------
 
-SPEC_RING_REDUCE_2_CORES = {
+SPEC_RING_REDUCE_2X1X1 = {
     "grid": (2, 1, 1),
     "seed": {
         0: {"%t": _tile(5.0)},
@@ -345,7 +345,7 @@ SPEC_RING_REDUCE_2_CORES = {
 }
 
 
-SPEC_RING_REDUCE_4_CORES = {
+SPEC_RING_REDUCE_4X1X1 = {
     "grid": (4, 1, 1),
     "seed": {
         0: {"%t": _tile(1.0)},
@@ -375,7 +375,7 @@ SPEC_RING_REDUCE_4_CORES = {
 # only participates in row y has only %r{y} checked. Non-participants
 # still return their input tile via ``CommOps.reduce``, but the spec
 # never asserts on those values.
-SPEC_RING_REDUCE_4X4_ROWS = {
+SPEC_RING_REDUCE_4X4X1_ROWS = {
     "grid": (4, 4, 1),
     "seed": {core_id: {"%t": _tile(float((core_id % 4) + 1))}
              for core_id in range(16)},
@@ -393,7 +393,7 @@ SPEC_RING_REDUCE_4X4_ROWS = {
 # Column x = [x, x+4, x+8, x+12]. Each column sums [1, 2, 3, 4] = 10.
 # Each column gets its own result name (%c0..%c3); see the row spec for
 # the rationale on per-group result names.
-SPEC_RING_REDUCE_4X4_COLS = {
+SPEC_RING_REDUCE_4X4X1_COLS = {
     "grid": (4, 4, 1),
     "seed": {core_id: {"%t": _tile(float((core_id // 4) + 1))}
              for core_id in range(16)},
@@ -417,10 +417,10 @@ SPEC_RING_REDUCE_4X4_COLS = {
 @pytest.mark.parametrize(
     "spec",
     [
-        pytest.param(SPEC_RING_REDUCE_2_CORES, id="2_cores"),
-        pytest.param(SPEC_RING_REDUCE_4_CORES, id="4_cores"),
-        pytest.param(SPEC_RING_REDUCE_4X4_ROWS, id="4x4_rows"),
-        pytest.param(SPEC_RING_REDUCE_4X4_COLS, id="4x4_cols"),
+        pytest.param(SPEC_RING_REDUCE_2X1X1, id="2x1x1"),
+        pytest.param(SPEC_RING_REDUCE_4X1X1, id="4x1x1"),
+        pytest.param(SPEC_RING_REDUCE_4X4X1_ROWS, id="4x4x1_rows"),
+        pytest.param(SPEC_RING_REDUCE_4X4X1_COLS, id="4x4x1_cols"),
     ],
 )
 def test_ring_reduce(spec, execute_fn):

@@ -476,7 +476,7 @@ class GridExecutor:
             _advance(core.core_id)
 
         while stacks:
-            if not any(_try_deliver(c) for c in list(stacks)):
+            if not any(_try_deliver(c) for c in tuple(stacks)):
                 wait_desc = "; ".join(
                     f"core {c} waiting on recv from core {s}"
                     for c, s in waiting.items()

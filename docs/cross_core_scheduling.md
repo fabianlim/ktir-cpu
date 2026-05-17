@@ -10,8 +10,8 @@ client code (yields)  RecvRequest(src)              — blocks until tile arrive
 GridExecutor          owns the message queue and drives every core's generator
 ```
 
-Everything else is either above this path (clients) or off it entirely
-(remote-LX peeks).
+Everything else is either above this path (clients of `CommOps`) or
+off it entirely (synchronous remote-LX peeks).
 
 ---
 
@@ -19,7 +19,13 @@ Everything else is either above this path (clients) or off it entirely
 
 ```
 KTIRInterpreter
-  └── GridExecutor.execute_with_communication(ops, input_ptrs, execute_op)
+  └── GridExecutor.execute_with_communication(ops, input_ptrs, execute_op,
+                                              transfer_backend)
+        │
+        ├── For each core:
+        │     CoreContext.attach_scheduler(send_fn, transfer_fn)
+        │       send_fn(dst, tile)     ← enqueues onto the scheduler's queue
+        │       transfer_fn(src_core)  ← curried transfer_backend.run(ctx, src)
         │
         ├── CoreExecutionStack (one per core)   ← only generator-aware layer
         │     ├── _execute_until_block(ops, execute_op)   generator
@@ -33,13 +39,9 @@ KTIRInterpreter
         ├── CoreContext (one per core)
         │     ├── SSA value map (_scope_stack)
         │     ├── LX scratchpad + usage tracking
-        │     ├── send_to(dst, tile)   ← wired to scheduler _enqueue before run
-        │     └── get_lx(core_id)      ← returns local LX or delegates to ring_backend
-        │
-        ├── RingBackend (injected into CoreContext at construction)
-        │     └── DirectLXBackend [current]
-        │           get_lx(core_id) → direct lookup into SpyreMemoryHierarchy
-        │           used for pre-seeded distributed views
+        │     ├── send_to(dst, tile)         ← public; uses _send_fn
+        │     └── get_lx(core_id)            ← public; local fast path,
+        │                                     remote case uses _transfer_fn
         │
         └── Scheduler loop
               messages: {(src,dst): deque[Tile]}
@@ -54,73 +56,58 @@ KTIRInterpreter
 
 | Layer | Responsibility | Notes |
 |---|---|---|
-| **`CommOps`** | High-level **per-core** comm primitives. Each call describes one core's view of the algorithm — its sends, its recvs, its result. Today: `reduce` (ring) and `transfer`. | Stable surface. Dialect handlers and tests should call into here, not into scheduler primitives directly. |
-| **`CoreContext`** | Per-core SSA scope, LX scratchpad, and `send_to`. `send_to` is wired by `GridExecutor` to enqueue into the scheduler's message queue. | |
+| **`CommOps`** | High-level **per-core** comm primitives. Stable surface for dialect handlers. Today: `reduce` (passthrough to a `ReduceBackend`). | Dialect handlers call into here, not into scheduler primitives directly. |
+| **`CoreContext`** | Per-core SSA scope, LX scratchpad, and the public `send_to` / `get_lx` methods. Per-run scheduler bindings (`_send_fn`, `_transfer_fn`) are installed via `attach_scheduler` and cleared via `detach_scheduler`. | |
 | **`CoreExecutionStack`** | Wraps one core's op list as a generator. The only place that calls `.send()` / `next()` on client generators. Bubbles `RecvRequest` to the scheduler via `yield from`. | Internal. |
-| **`GridExecutor`** | Owns cores, the message queue, and the scheduler loop. Drives every core's generator to completion or raises on deadlock. | Internal. |
-| **`RingBackend.get_lx`** | Remote LX peek for cross-core memory views. Off the comm path — returns a scratchpad reference, no messages, no scheduling. | Only `get_lx` is live (see "Marked for deletion" below). |
+| **`GridExecutor`** | Owns cores, the message queue, and the scheduler loop. Attaches scheduler bindings on every core before stepping; drives every generator to completion or raises on deadlock. | Internal. |
+| **`ReduceBackend`** / **`TransferBackend`** | Pluggable algorithms / transports. `ReduceBackend.run` is per-core, may yield `RecvRequest`. `TransferBackend.run` resolves remote LX access. Siblings under the scheduler protocol; distinct purposes. | See "Pluggable …" sections. |
 
 ---
 
 ## Per-core semantics
 
-Every `CommOps` primitive describes **one core's behavior**. The function
-runs once per participating core; the scheduler runs N copies concurrently;
-they cooperate via the message queue.
+`CommOps` primitives describe **one core's behavior**. The function
+runs once per participating core; the scheduler runs N copies
+concurrently; they cooperate via the message queue.
 
-### `CommOps.reduce` — ring reduction
+### `CommOps.reduce` — passthrough to a `ReduceBackend`
 
-Implements ring reduction from the perspective of one core. Each round:
-send to the next neighbor, recv from the previous neighbor, accumulate.
-After N-1 rounds, each core holds the full reduction.
-
-```
-my_idx   = group.index(ctx.core_id)
-result   = tile
-for _ in range(len(group) - 1):
-    ctx.send_to(group[(my_idx + 1) % n], result)
-    received = yield RecvRequest(src=group[(my_idx - 1) % n])
-    result   = fn(result, received)
-return result
+```python
+@staticmethod
+def reduce(ctx, tile, core_group, backend: ReduceBackend):
+    return backend.run(ctx, tile, core_group)
 ```
 
-Yields **N-1 `RecvRequest`s** for the calling core (one per ring hop).
-Every participating core runs its own copy. Cores not in `group` simply
-don't call `CommOps.reduce` — they're not participants, no special case.
-
-### `CommOps.transfer` — multi-destination send
-
-Plain function, no yields. Calls `ctx.send_to(d, tile)` for each `d` in
-`dst_cores`. The receiving cores must call into `CommOps` (or a future
-recv primitive) to consume the tile.
+The algorithm — ring rounds, LX-scratchpad accumulation, etc. — lives
+in the backend. `CommOps.reduce` exists so dialect handlers and tests
+have a single stable entry point regardless of which algorithm is in
+play. See `RingReduceBackend` for the canonical ring algorithm and a
+worked example.
 
 ---
 
 ## Generator vs plain function — the rule
 
-A `CommOps` primitive is a generator iff it can block.
+A backend method (or any client of the scheduler protocol) is a
+generator iff it can block.
 
 - Generator: contains `yield RecvRequest(...)`. Calling it returns a
-  generator object; the body has not yet run. The scheduler drives it.
+  generator object; the body has not yet run. The scheduler drives
+  it.
 - Plain function: no `yield`. Calling it runs the body to completion.
 
-| Primitive | Shape |
-|---|---|
-| `CommOps.reduce` | generator (yields N-1 times for the calling core) |
-| `CommOps.transfer` | plain |
-
-A handler that calls a generator primitive must **propagate** the
-generator — don't call it and discard the result:
+A handler that calls a generator-shaped backend must **propagate**
+the generator — don't call it and discard the result:
 
 ```python
-return CommOps.reduce(ctx, tile, group, fn)              # OK — scheduler drives it
-return (yield from CommOps.reduce(ctx, tile, group, fn)) # OK — handler is itself a generator
-CommOps.reduce(ctx, tile, group, fn)                     # BUG — generator created, body never runs
+return CommOps.reduce(ctx, tile, group, backend)              # OK — scheduler drives it
+return (yield from CommOps.reduce(ctx, tile, group, backend)) # OK — handler is itself a generator
+CommOps.reduce(ctx, tile, group, backend)                     # BUG — generator created, body never runs
 ```
 
-**Key invariant:** `send_to` is fire-and-forget — the sender never blocks.
-Only `yield RecvRequest` suspends a core. This prevents sender-side
-deadlock in symmetric patterns (all-to-all, ring).
+**Key invariant:** `send_to` is fire-and-forget — the sender never
+blocks. Only `yield RecvRequest` suspends a core. This prevents
+sender-side deadlock in symmetric patterns (all-to-all, ring).
 
 ---
 
@@ -128,12 +115,13 @@ deadlock in symmetric patterns (all-to-all, ring).
 
 ```
 dialect handler / test handler
-  └── CommOps.reduce(ctx, tile, group, fn)        ← generator object
-        for each round:
-          ctx.send_to(next_core, result)          ← enqueues immediately
-          received = yield RecvRequest(src=prev)  ← suspends here
-          result   = fn(result, received)
-        return result
+  └── CommOps.reduce(ctx, tile, group, backend)   ← passthrough
+        backend.run(ctx, tile, group)             ← generator object
+          for each round:
+            ctx.send_to(next_core, tile)          ← enqueues immediately
+            received = yield RecvRequest(src=prev) ← suspends here
+            ...
+          return result
 
 CoreExecutionStack._execute_until_block
   result = execute_op(op, core)                   ← gets the generator
@@ -169,37 +157,29 @@ RuntimeError("Deadlock detected: core 0 waiting on recv from core 1; ...")
 
 This catches both flat deadlocks (mutual recv with no sends) and
 loop-induced deadlocks (one side exhausts its sends before the other
-finishes recving).
+finishes recving). The deadlock tests in `tests/test_grid_scheduler.py`
+exercise three protocol-break shapes (recv-only, wrong-destination,
+extra-recv) by monkey-patching `RingReduceBackend.run` and assert the
+scheduler raises this error.
 
 ---
 
-## Future direction — pluggable backends
+## Pluggable reduction backends
 
-`CommOps.reduce` today hard-codes the ring algorithm. The next
-iteration makes the reduction strategy pluggable, and folds the
-remote-LX peek path (`RingBackend.get_lx`) into the same abstraction.
-This section describes the target shape; nothing here exists yet.
+`CommOps.reduce` is a passthrough — the algorithm lives in a
+`ReduceBackend`. The motivation is hardware variety: ring is one of
+several plausible implementations of "combine values across a group."
+Tree, recursive halving-doubling, and an LX-scratchpad reduction
+(each core writes its partial into a designated LX slot on a target
+core, no ring messages) all have valid cost profiles depending on
+tile size, group shape, and available bandwidth.
 
-### Pluggable reduction algorithms
-
-The motivation is hardware variety: ring is one of several plausible
-implementations of "combine values across a group." Tree, recursive
-halving-doubling, and an LX-scratchpad reduction (each core writes its
-partial into a designated LX slot on a target core, no ring messages)
-all have valid cost profiles depending on tile size, group shape, and
-available bandwidth.
-
-The design separates *what* (semantics: combine N tiles into one) from
-*how* (algorithm: ring vs. tree vs. LX):
+The design separates *what* (semantics: combine N tiles into one)
+from *how* (algorithm: ring vs. tree vs. LX):
 
 ```python
 class ReduceBackend(ABC):
-    """Owns the full reduce protocol: messaging, compute, completion.
-
-    run() is a generator — yields RecvRequest at each blocking point.
-    The scheduler drives it identically to CommOps.reduce today.
-    Returns the result tile for this core when complete.
-    """
+    """Owns the full reduce protocol: messaging, compute, completion."""
 
     @abstractmethod
     def run(self, ctx: CoreContext, tile: Tile,
@@ -207,109 +187,92 @@ class ReduceBackend(ABC):
         ...
 ```
 
-`CommOps.reduce` becomes a passthrough:
-
-```python
-@staticmethod
-def reduce(ctx, tile, core_group, backend: ReduceBackend):
-    return backend.run(ctx, tile, core_group)
-```
-
 Concrete backends:
 
-- **`RingReduceBackend`** — current logic moves here verbatim. Yields
-  `N-1` `RecvRequest`s per core.
-- **`LXReduceBackend`** — each core writes its partial into a target
-  core's LX scratchpad slot via `ctx.get_lx(target_core)`. Synchronous
-  (no yields) when LX is directly addressable. Useful when partition
-  count is small and ring latency dominates.
+- **`RingReduceBackend`** *(implemented)* — N-1 ring rounds. Yields
+  `N-1` `RecvRequest`s per core. The canonical algorithm.
+- **`LXReduceBackend`** *(future)* — each core writes its partial into
+  a target core's LX scratchpad slot via `ctx.get_lx(target_core)`.
+  Synchronous (no yields) when LX is directly addressable. Useful
+  when partition count is small and ring latency dominates.
 
-### Backend selection — open question
+### Backend selection
 
-Two plausible injection points:
+The dialect handler picks the backend. Selection happens at the
+handler boundary, not in `CommOps` and not via the execution
+environment — backend choice belongs with the IR.
 
-1. **From op attributes.** A `ktdp.reduce` op carries
-   `#ktdp.reduce_kind = "ring" | "lx" | …`; the dialect handler picks
-   the backend.
-2. **From an execution environment.** `env.reduce_backend_cls` is set
-   before `execute_function`; handler reads it and instantiates. Lets
-   experiments swap backends without touching MLIR.
-
-(2) is more flexible for split-K and similar exploration; (1) is
-preferable once a backend choice is meant to be persisted with the IR.
-Likely both end up supported, with attribute precedence over env.
-
-### Unifying remote-LX peeks under the same abstraction
-
-The remote-LX path (`CoreContext.get_lx(other_core)`) currently goes
-through a separate `RingBackend` hierarchy whose only live method is
-`get_lx`. The off-the-comm-path `send` / `recv` methods on
-`RingBackend` and `DirectLXBackend` exist as vestigial parallel comm —
-they buffer through `RingNetwork`, which the scheduler never reads
-from. Those methods, and `RingNetwork` itself, will be deleted (see
-"Marked for deletion" below).
-
-Once they're gone, the remaining `RingBackend.get_lx` covers two
-distinct cases:
-
-- **Pre-seeded LX.** Host wrote each partition before kernel start
-  (e.g. `construct_distributed_memory_view`). Synchronous lookup —
-  return the scratchpad reference, no scheduling needed. This is the
-  current `DirectLXBackend.get_lx`.
-- **Ring-transfer LX.** Remote partition has to be fetched at runtime
-  via the ring. The peek must yield `RecvRequest`s the scheduler can
-  drive — the same protocol as `ReduceBackend.run`.
-
-Both cases produce a generator-or-value contract that matches the
-scheduler protocol. So `RingBackend` and `ReduceBackend` end up
-sharing a contract: *"a client of the scheduler protocol, generating
-`send_to` calls and `RecvRequest` yields, returning a value the
-scheduler binds."*
-
-Whether to merge them under one base class or keep them as siblings
-sharing a documented contract is a judgement call:
-
-- **Sibling abstractions, shared contract** (preferred for now). They
-  have different *purposes* — one fetches memory, one runs a
-  reduction algorithm — and merging them creates a god-class that
-  does two unrelated things just because both speak the protocol.
-  Keep them separate; document the shared contract.
-- **One base class.** Worth doing once a third client of the protocol
-  shows up and the duplication starts to cost something concrete.
-
-### `CoreContext.send_to` — proper attach API
-
-The scheduler currently sets `core._send_fn` directly (a
-leading-underscore attribute). Replace with an explicit attach/detach
-API on `CoreContext`:
+The pattern uses a small explicit registry, mirroring the existing
+parser/handler registries:
 
 ```python
-core.attach_scheduler(send_fn)   # called once before running this core
-core.detach_scheduler()           # called when this core's stack is done
+@register("ktdp.reduce", latency_category=LC.COMM)
+@register_reduce_backend("ktdp.reduce", RingReduceBackend)
+def ktdp__reduce(op, context, env):
+    backend_cls = get_reduce_backend(op.op_type)
+    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
+    return CommOps.reduce(context, tile, core_group, backend_cls(reduce_fn))
 ```
 
-Same effect, but the leak of the underscore name into `GridExecutor`
-goes away, and the lifetime of the binding is documented at the
-attach/detach call sites instead of being implicit. This is a small
-mechanical cleanup, not a behavior change.
+When a second backend lands, the handler resolves it from the same
+registry. Whether a single op type with a `kind` attribute or a
+sibling op type (`ktdp.reduce_ring`, `ktdp.reduce_lx`) is the right
+shape is a future decision — both put the choice in the IR.
 
 ---
 
-## Marked for deletion
+## Pluggable transfer backends
 
-These exist from an earlier iteration of the comm design and are **not
-on the live scheduler path**. They are obsoleted by the future
-direction above; deletion is independent of and should not block that
-work.
+Cross-core memory access (`ctx.get_lx(other_core)`) is served by a
+`TransferBackend`. The backend is supplied per execution as a direct
+parameter to `GridExecutor.execute_with_communication`, which curries
+it into a per-core `transfer_fn` and binds it to each core through
+`CoreContext.attach_scheduler` for the duration of the run.
 
-| Symbol | Location | Why dead |
-|---|---|---|
-| `RingBackend.send` / `RingBackend.recv` | `ktir_cpu/ops/comm_ops.py` | No caller on the scheduler path. `CommOps` and `CoreContext.send_to` do not use them. |
-| `RingNetwork` | `ktir_cpu/ops/comm_ops.py` | Parallel message-buffer the scheduler doesn't read from or write to. The future ring-transfer path will use the scheduler protocol directly, not a separate buffer. |
-| `DirectLXBackend.send` / `DirectLXBackend.recv` | `ktir_cpu/ops/comm_ops.py` | Pass-through to `RingNetwork`; same reason. |
+`transfer_backend` deliberately does **not** live on `ExecutionEnv` —
+`ExecutionEnv` is for handler-visible services, and no handler reads
+the backend directly.
 
-`RingBackend.get_lx` and `DirectLXBackend.get_lx` are live and stay —
-they support remote LX peeks for distributed memory views.
+Concrete backends:
+
+- **`InstantTransferBackend`** *(implemented)* — synchronous lookup,
+  returns the target scratchpad handle. The default for pre-seeded
+  LX (e.g. `construct_distributed_memory_view`).
+- **`LXTransferBackend`** *(future)* — fetches bytes via the ring,
+  yielding `RecvRequest` while data crosses the ring. Same scheduler
+  protocol as `RingReduceBackend`. When this lands, callers of
+  `ctx.get_lx` will need to drive the resulting generator through the
+  scheduler (today the path is synchronous).
+
+`ReduceBackend` and `TransferBackend` are siblings under the same
+scheduler protocol but distinct purposes (algorithm vs. memory), so
+they remain separate hierarchies rather than merging under a common
+base.
+
+---
+
+## Per-core scheduler bindings
+
+`CoreContext` does not own a backend — only the per-run injected
+functions. The scheduler binds them at the start of a run via an
+explicit lifecycle:
+
+```python
+core.attach_scheduler(send_fn=..., transfer_fn=...)
+# scheduler drives each core's generator
+core.detach_scheduler()
+```
+
+`send_fn(dst, tile)` enqueues a tile into the scheduler's message
+buffer. `transfer_fn(src_core)` is the curried
+`transfer_backend.run(ctx, src_core)` and is invoked only for
+genuinely-remote cores — the local fast path short-circuits inside
+`ctx.get_lx` before reaching the function.
+
+The two bindings are installed and cleared together; this replaces
+the earlier implicit `core._send_fn = ...` field mutation. A
+detached `CoreContext` raises clearly when `send_to` or remote
+`get_lx` is called.
 
 ---
 
@@ -317,9 +280,8 @@ they support remote LX peeks for distributed memory views.
 
 | Symbol | File |
 |---|---|
-| `RecvRequest` | `ktir_cpu/grid.py` (lives here, not `comm_ops.py`, to avoid circular import) |
-| `CoreContext.send_to`, `CoreContext.get_lx` | `ktir_cpu/grid.py` |
-| `CoreExecutionStack` | `ktir_cpu/grid.py` |
-| `GridExecutor.execute_with_communication` | `ktir_cpu/grid.py` |
-| `CommOps.reduce`, `CommOps.transfer` | `ktir_cpu/ops/comm_ops.py` |
-| `RingBackend`, `DirectLXBackend` | `ktir_cpu/ops/comm_ops.py` |
+| `RecvRequest`, `CoreContext`, `CoreExecutionStack`, `GridExecutor` | `ktir_cpu/grid.py` |
+| `CommOps`, `ReduceBackend`, `RingReduceBackend` | `ktir_cpu/ops/comm_ops.py` |
+| `TransferBackend`, `InstantTransferBackend` | `ktir_cpu/ops/comm_ops.py` |
+| `register_reduce_backend`, `get_reduce_backend` | `ktir_cpu/ops/comm_ops.py` |
+| `ExecutionEnv` | `ktir_cpu/dialects/registry.py` |
