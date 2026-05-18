@@ -522,3 +522,56 @@ def test_scheduler_detects_deadlock(broken_run, execute_fn, monkeypatch):
     monkeypatch.setattr(RingReduceBackend, "run", broken_run)
     with pytest.raises(RuntimeError, match="Deadlock detected"):
         run_spec(SPEC_RING_REDUCE_4_CORES, execute_fn)
+
+
+# ---------------------------------------------------------------------------
+# Regression: parallel scheduler vs single-pass oracle on local kernels
+# ---------------------------------------------------------------------------
+# ``KTIRInterpreter(disable_comms=True)`` routes ``execute_function``
+# through ``GridExecutor.execute_sequential`` — the pre-generator
+# single-pass loop preserved as a regression oracle.  It is unsafe for
+# kernels with cross-core comm (raises if a comm op is encountered) but
+# is the right oracle for kernels that are statically comm-free: the
+# generator scheduler must produce bit-identical output to the
+# single-pass loop.
+#
+# Each test builds two fresh interpreters (one per scheduler) so HBM,
+# LX, and any other allocator state start clean.  No state is shared
+# across the two runs.  Inputs come from the shared conftest helpers
+# (``make_matmul_inputs`` / ``make_softmax_inputs``) so this test sees
+# the exact same recipe as test_examples and test_latency.
+# ---------------------------------------------------------------------------
+
+from ktir_cpu import KTIRInterpreter
+from conftest import get_test_params, make_matmul_inputs, make_softmax_inputs
+
+
+@pytest.mark.parametrize(
+    "path,func_name,entry,make_inputs",
+    (
+        [(*p, make_matmul_inputs) for p in get_test_params("matmul_kernel_small")] +
+        [(*p, make_softmax_inputs) for p in get_test_params("softmax_kernel_small")]
+    ),
+    ids=lambda v: getattr(v, "__name__", None) or None,
+)
+def test_disable_comms_matches_parallel_scheduler(
+    path, func_name, entry, make_inputs,
+):
+    """For comm-free kernels, ``disable_comms=True`` must produce
+    bit-identical output to the default parallel scheduler.
+
+    Acts as a regression oracle for ``execute_with_communication``: any
+    future change that affects per-core ordering or state will diverge
+    from ``execute_sequential`` and fail this test.
+    """
+    def _run(disable_comms: bool):
+        interp = KTIRInterpreter(disable_comms=disable_comms)
+        interp.load(path)
+        kwargs, output_keys = make_inputs(interp, func_name, entry)
+        outputs = interp.execute_function(func_name, **kwargs)
+        return {k: outputs[k] for k in output_keys}
+
+    parallel   = _run(disable_comms=False)
+    sequential = _run(disable_comms=True)
+    for k, parallel_out in parallel.items():
+        np.testing.assert_array_equal(parallel_out, sequential[k])

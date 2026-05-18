@@ -65,6 +65,8 @@ from functools import lru_cache
 from pathlib import Path
 from dataclasses import dataclass
 
+import numpy as np
+
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 
 # ---------------------------------------------------------------------------
@@ -405,3 +407,120 @@ def parse_example(path: str, func_name: str) -> ExampleMeta:
     """
     mlir_text = Path(path).read_text()
     return _parse_mlir_meta(mlir_text, func_name)
+
+
+# ---------------------------------------------------------------------------
+# Per-kernel input builders — shared default-recipe input construction
+# ---------------------------------------------------------------------------
+# Centralizes the default RNG-seeded input recipe (seed 42, standard normal,
+# zero output buffer, plus kernel-specific quirks like softmax's ~76% real
+# / -inf padding) so every test that runs the same kernel sees identical
+# inputs.  Used by:
+#
+#   - test_examples.py (correctness)
+#   - test_latency.py  (cycle / roofline measurement)
+#   - test_grid_scheduler.py (parallel-vs-sequential regression)
+#
+# When a test needs *different* inputs (e.g. zeros + linspace, or a
+# specific edge case), it should construct them inline rather than add a
+# parameter to these helpers — the goal here is one source of truth for
+# the *default* recipe, not a generic kwargs builder.
+#
+# Each helper takes an already-loaded interpreter so it can read tensor
+# sizes from the parsed module.  Returns ``(execute_kwargs, output_keys)``
+# where output_keys lists the kwarg names that hold output buffers (the
+# caller reads results from ``outputs[k]`` for k in output_keys).
+# ---------------------------------------------------------------------------
+
+def make_softmax_inputs(interp, func_name: str, entry: dict):
+    """Inputs for softmax_kernel / softmax_kernel_small.
+
+    Recipe: seed 42 standard normal, ~76% real columns, -inf padding,
+    zero output.  Argument names are looked up positionally via
+    ``interp.arg_names`` so the helper works under any parser backend
+    (regex parser preserves source names; MLIRFrontendParser
+    normalizes to ``arg0``, ``arg1``, ...).
+
+    Source-level signature (positional): ``output_ptr, input_ptr, n_rows[, ...]``.
+    Trailing args (e.g. ``BLOCK_SIZE`` on softmax_kernel_small) are
+    pulled from ``entry["execute_kwargs"]`` by their source names.
+    """
+    arg_names = interp.arg_names(func_name)
+    output_arg, input_arg, n_rows_arg, *trailing = arg_names
+    sizes = interp.tensor_input_output_sizes(func_name)
+    n_rows, n_padded_cols = sizes[input_arg]["shape"]
+    n_real_cols = int(n_padded_cols * 0.76)
+    rng = np.random.default_rng(42)
+    inp = np.full((n_rows, n_padded_cols), float('-inf'), dtype=np.float16)
+    inp[:, :n_real_cols] = rng.standard_normal(
+        (n_rows, n_real_cols)
+    ).astype(np.float16)
+    out = np.zeros((n_rows, n_padded_cols), dtype=np.float16)
+    ek = entry["execute_kwargs"]
+    kwargs = {
+        output_arg: out,
+        input_arg: inp,
+        n_rows_arg: ek["n_rows"],
+    }
+    # Map any remaining declared args from execute_kwargs by source name.
+    # Under a normalizing parser, arg_names are positional so we can't
+    # match by name; rely on declaration order matching ek's keys minus
+    # the leading three.
+    trailing_source_names = ["BLOCK_SIZE"]  # softmax_small only; full has none
+    for arg, src in zip(trailing, trailing_source_names):
+        if src in ek and ek[src] is not None:
+            kwargs[arg] = ek[src]
+    return kwargs, [output_arg]
+
+
+def make_matmul_inputs(interp, func_name: str, entry: dict):
+    """Inputs for matmul_kernel / matmul_kernel_small.
+
+    Recipe: seed 42 standard normal A and B, zero output C.  Argument
+    names are looked up positionally via ``interp.arg_names`` so the
+    helper works under any parser backend.
+
+    Source-level signature (positional): ``a_ptr, b_ptr, c_ptr, K,
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K``.
+    """
+    arg_names = interp.arg_names(func_name)
+    a_arg, b_arg, c_arg, *scalar_args = arg_names
+    ek = entry["execute_kwargs"]
+    M, N, K = ek["M"], ek["N"], ek["K"]
+    rng = np.random.default_rng(42)
+    A = rng.standard_normal((M, K)).astype(np.float16)
+    B = rng.standard_normal((K, N)).astype(np.float16)
+    C = np.zeros((M, N), dtype=np.float16)
+    kwargs = {a_arg: A, b_arg: B, c_arg: C}
+    scalar_source_names = ["K", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"]
+    for arg, src in zip(scalar_args, scalar_source_names):
+        kwargs[arg] = ek[src]
+    return kwargs, [c_arg]
+
+
+def make_vector_add_inputs(interp, func_name: str, entry: dict):
+    """Inputs for add_kernel.
+
+    Recipe: seed 42 standard normal x and y, zero output.  Argument
+    names are looked up positionally via ``interp.arg_names`` so the
+    helper works under any parser backend.
+
+    Source-level signature (positional): ``x_ptr, y_ptr, output_ptr,
+    BLOCK_SIZE``.  Tests that need bespoke inputs (zeros + linspace,
+    etc.) should build them inline rather than parameterize this helper.
+    """
+    arg_names = interp.arg_names(func_name)
+    x_arg, y_arg, output_arg, block_arg = arg_names
+    sizes = interp.tensor_input_output_sizes(func_name)
+    (n,) = sizes[x_arg]["shape"]
+    rng = np.random.default_rng(42)
+    x = rng.standard_normal(n).astype(np.float16)
+    y = rng.standard_normal(n).astype(np.float16)
+    out = np.zeros(n, dtype=np.float16)
+    kwargs = {
+        x_arg: x,
+        y_arg: y,
+        output_arg: out,
+        block_arg: entry["execute_kwargs"]["BLOCK_SIZE"],
+    }
+    return kwargs, [output_arg]

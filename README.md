@@ -132,6 +132,18 @@ execute_function("fn", **inputs)
     └─ collect output tensors from HBM
 ```
 
+#### Disabling cross-core comms
+
+By default, `execute_function` drives cores through a generator-based scheduler that handles cross-core sends and recvs (`ktdp.reduce`, `ktdp.transfer`, etc.). For kernels that are statically comm-free — pure local compute on each core — you can opt out and run a simpler single-pass loop with `disable_comms=True`:
+
+```python
+interp = KTIRInterpreter(disable_comms=True)
+interp.load("examples/triton-ktir/matmul_fwd_ktir.mlir")
+interp.execute_function("matmul_kernel", a_ptr=A, b_ptr=B, c_ptr=C, ...)
+```
+
+This routes execution through `GridExecutor.execute_sequential`, which runs each core's full op list independently in core-id order — no scheduler loop, no message queue. If a comm op is encountered, it raises `RuntimeError` rather than silently dropping the yield, so misuse is loud not silent. The flag is mainly useful as a regression oracle for the parallel scheduler (see `tests/test_grid_scheduler.py::test_disable_comms_matches_parallel_scheduler`).
+
 ### Memory hierarchy
 
 Two memory spaces are simulated:

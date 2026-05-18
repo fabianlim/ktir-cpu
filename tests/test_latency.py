@@ -23,7 +23,14 @@ from pathlib import Path
 
 from ktir_cpu import KTIRInterpreter, HardwareConfig, LatencyReport
 
-from conftest import EXAMPLES_DIR, get_test_params, parse_example
+from conftest import (
+    EXAMPLES_DIR,
+    get_test_params,
+    make_matmul_inputs,
+    make_softmax_inputs,
+    make_vector_add_inputs,
+    parse_example,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -31,64 +38,40 @@ from conftest import EXAMPLES_DIR, get_test_params, parse_example
 
 
 def _run_vector_add(path, func_name, entry, cfg, trace=False):
-    """Run vector_add and return (report, outputs)."""
+    """Run vector_add and return (report, outputs).
+
+    Input recipe lives in ``conftest.make_vector_add_inputs`` so this
+    file, ``test_examples``, and ``test_grid_scheduler`` all see the
+    same default-seed inputs.
+    """
     interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
     interp.load(path)
-
-    sizes = interp.tensor_input_output_sizes(func_name)
-    n = sizes["x_ptr"]["shape"][0]
-    rng = np.random.default_rng(42)
-    x = rng.standard_normal(n).astype(np.float16)
-    y = rng.standard_normal(n).astype(np.float16)
-    out = np.zeros(n, dtype=np.float16)
-    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-    outputs = interp.execute_function(
-        func_name, x_ptr=x, y_ptr=y, output_ptr=out, **kwargs
-    )
+    kwargs, _ = make_vector_add_inputs(interp, func_name, entry)
+    outputs = interp.execute_function(func_name, **kwargs)
     return interp.get_latency_report(), outputs
 
 
 def _run_softmax(path, func_name, entry, cfg, trace=False):
-    """Run softmax on 32 cores and return report."""
+    """Run softmax_kernel(_small) and return report.
+
+    Input recipe lives in ``conftest.make_softmax_inputs``.
+    """
     interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
     interp.load(path)
-
-    sizes = interp.tensor_input_output_sizes(func_name)
-    n_rows, n_padded_cols = sizes["input_ptr"]["shape"]
-
-    n_real_cols = int(n_padded_cols * 0.76)  # ~76% real data, rest is -inf
-    rng = np.random.default_rng(42)
-    inp = np.full((n_rows, n_padded_cols), float('-inf'), dtype=np.float16)
-    inp[:, :n_real_cols] = rng.standard_normal(
-        (n_rows, n_real_cols)
-    ).astype(np.float16)
-    out = np.zeros((n_rows, n_padded_cols), dtype=np.float16)
-    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-    kwargs["n_cols"] = n_real_cols  # fill dynamic kwarg from actual sizes
-    interp.execute_function(
-        func_name,
-        output_ptr=out, input_ptr=inp,
-        **kwargs,
-    )
+    kwargs, _ = make_softmax_inputs(interp, func_name, entry)
+    interp.execute_function(func_name, **kwargs)
     return interp.get_latency_report()
 
 
 def _run_matmul(path, func_name, entry, cfg, trace=False):
-    """Run matmul on the full grid and return report."""
+    """Run matmul_kernel(_small) and return report.
+
+    Input recipe lives in ``conftest.make_matmul_inputs``.
+    """
     interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
     interp.load(path)
-
-    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-    M, N, K = kwargs["M"], kwargs["N"], kwargs["K"]
-    rng = np.random.default_rng(42)
-    A = rng.standard_normal((M, K)).astype(np.float16)
-    B = rng.standard_normal((K, N)).astype(np.float16)
-    C = np.zeros((M, N), dtype=np.float16)
-    interp.execute_function(
-        func_name,
-        a_ptr=A, b_ptr=B, c_ptr=C,
-        **kwargs,
-    )
+    kwargs, _ = make_matmul_inputs(interp, func_name, entry)
+    interp.execute_function(func_name, **kwargs)
     return interp.get_latency_report()
 
 

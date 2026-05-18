@@ -46,6 +46,7 @@ class KTIRInterpreter:
         latency_config: Optional[HardwareConfig] = None,
         trace_latency: bool = False,
         parser: Optional[KTIRParserBase] = None,
+        disable_comms: bool = False,
     ):
         """Create a KTIR interpreter.
 
@@ -61,6 +62,12 @@ class KTIRInterpreter:
             parser: Parser to use in ``load()``.  Defaults to ``KTIRParser``
                 when ``None``.  Any object satisfying ``KTIRParserBase``
                 (i.e. has ``parse_module(str) -> IRModule``) is accepted.
+            disable_comms: If ``True``, ``execute_function`` runs each
+                core independently in core-id order with no scheduler
+                loop or message queue (``GridExecutor.execute_sequential``).
+                Only valid for kernels with no cross-core comm; raises
+                ``RuntimeError`` if a comm op is encountered.  Useful as
+                a regression oracle for the parallel scheduler.
         """
         self.module: Optional[IRModule] = None
         self.memory: Optional[SpyreMemoryHierarchy] = None
@@ -74,6 +81,7 @@ class KTIRInterpreter:
             LatencyTracker(latency_config, trace=trace_latency)
             if latency_config is not None else None
         )
+        self._disable_comms: bool = disable_comms
 
     def load(self, ktir_source: str):
         """Load and parse KTIR from a file path or MLIR text.
@@ -160,10 +168,15 @@ class KTIRInterpreter:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
 
-        self.grid_executor.execute_with_communication(
-            func.operations, input_ptrs, self._execute_op,
-            transfer_backend=self.ring_backend,
-        )
+        if self._disable_comms:
+            self.grid_executor.execute_sequential(
+                func.operations, input_ptrs, self._execute_op,
+            )
+        else:
+            self.grid_executor.execute_with_communication(
+                func.operations, input_ptrs, self._execute_op,
+                transfer_backend=self.ring_backend,
+            )
 
         # Read output tensors from HBM
         outputs = {}

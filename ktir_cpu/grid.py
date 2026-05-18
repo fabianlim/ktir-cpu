@@ -541,3 +541,48 @@ class GridExecutor:
                 raise RuntimeError(f"Deadlock detected: {wait_desc}")
 
         return [results[i] for i in range(self.num_cores)]
+
+    def execute_sequential(
+        self,
+        operations: List["Operation"],
+        input_ptrs: Dict[str, Any],
+        execute_op: Callable[["Operation", "CoreContext"], Any],
+    ) -> List[Any]:
+        """Single-pass per-core execution with no comm support.
+
+        Mirrors the pre-generator scheduler semantics: each core runs the
+        full op list independently, in core-id order, with no scheduler
+        loop and no message queue.  Kept as a regression oracle for
+        ``execute_with_communication`` on local-only kernels (matmul,
+        softmax, ...) and as the implementation behind
+        ``KTIRInterpreter(disable_comms=True)``.
+
+        Raises ``RuntimeError`` if any op returns a generator — comm ops
+        are unsupported here, and silent yield-dropping would produce
+        wrong results.  The error is the contract: this path is for
+        kernels that are statically comm-free.
+        """
+        if not operations:
+            return [None] * self.num_cores
+        if not callable(execute_op):
+            raise ValueError(
+                f"execute_op must be callable, got {type(execute_op)!r}"
+            )
+        if input_ptrs is None:
+            input_ptrs = {}
+        results: List[Any] = []
+        for core in self.cores:
+            for k, v in input_ptrs.items():
+                core.set_value("%" + k, v)
+            result = None
+            for op in operations:
+                result = execute_op(op, core)
+                if inspect.isgenerator(result):
+                    raise RuntimeError(
+                        f"execute_sequential encountered comm op {op.op_type!r} "
+                        f"on core {core.core_id}: this path does not run the "
+                        "scheduler. Use execute_with_communication for kernels "
+                        "with cross-core comm."
+                    )
+            results.append(result)
+        return results

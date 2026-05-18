@@ -24,7 +24,13 @@ import pytest
 
 from ktir_cpu import KTIRInterpreter
 
-from conftest import get_test_params, parse_example
+from conftest import (
+    get_test_params,
+    make_matmul_inputs,
+    make_softmax_inputs,
+    make_vector_add_inputs,
+    parse_example,
+)
 
 
 class InterpreterTestMixin:
@@ -151,20 +157,12 @@ class TestVectorAddExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        x_ptr, y_ptr, output_ptr, BLOCK_SIZE = interp.arg_names(func_name)
-        sizes = interp.tensor_input_output_sizes(func_name)
-        (n,) = sizes[x_ptr]["shape"]
-        rng = np.random.default_rng(42)
-        x = rng.standard_normal(n).astype(np.float16)
-        y = rng.standard_normal(n).astype(np.float16)
-        output = np.zeros(n, dtype=np.float16)
+        kwargs, [output_arg] = make_vector_add_inputs(interp, func_name, entry)
+        x_arg, y_arg, *_ = interp.arg_names(func_name)
+        x, y = kwargs[x_arg], kwargs[y_arg]
+        outputs = interp.execute_function(func_name, **kwargs)
 
-        outputs = interp.execute_function(func_name, **{
-            x_ptr: x, y_ptr: y, output_ptr: output,
-            BLOCK_SIZE: entry["execute_kwargs"]["BLOCK_SIZE"],
-        })
-
-        result = outputs[output_ptr]
+        result = outputs[output_arg]
         expected = (x + y).astype(np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
@@ -228,24 +226,11 @@ class TestSoftmaxExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        output_ptr, input_ptr, n_rows = interp.arg_names(func_name)
-        sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows_val, n_padded_cols = sizes[input_ptr]["shape"]
-        rng = np.random.default_rng(42)
-        n_real_cols = int(n_padded_cols * 0.76)  # test with padding: ~76% real data
-
-        # Padded input: first n_real_cols are real data, rest is -inf
-        inp = np.full((n_rows_val, n_padded_cols), float('-inf'), dtype=np.float16)
-        inp[:, :n_real_cols] = rng.standard_normal(
-            (n_rows_val, n_real_cols)
-        ).astype(np.float16)
-        out = np.zeros((n_rows_val, n_padded_cols), dtype=np.float16)
-
-        outputs = interp.execute_function(func_name, **{
-            output_ptr: out, input_ptr: inp,
-            n_rows: entry["execute_kwargs"]["n_rows"],
-        })
-        result = outputs[output_ptr]
+        kwargs, [output_arg] = make_softmax_inputs(interp, func_name, entry)
+        _, input_arg, *_ = interp.arg_names(func_name)
+        inp = kwargs[input_arg]
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[output_arg]
 
         # NumPy reference: softmax per row
         m = np.max(inp, axis=1, keepdims=True)
@@ -380,22 +365,11 @@ class TestMatMulExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        a_ptr, b_ptr, c_ptr, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = interp.arg_names(func_name)
-        ek = entry["execute_kwargs"]
-        M, N, K_val = ek["M"], ek["N"], ek["K"]
-        rng = np.random.default_rng(42)
-        A = rng.standard_normal((M, K_val)).astype(np.float16)
-        B = rng.standard_normal((K_val, N)).astype(np.float16)
-        C = np.zeros((M, N), dtype=np.float16)
-
-        outputs = interp.execute_function(func_name, **{
-            a_ptr: A, b_ptr: B, c_ptr: C,
-            K: ek["K"],
-            BLOCK_SIZE_M: ek["BLOCK_SIZE_M"],
-            BLOCK_SIZE_N: ek["BLOCK_SIZE_N"],
-            BLOCK_SIZE_K: ek["BLOCK_SIZE_K"],
-        })
-        result_C = outputs[c_ptr]
+        kwargs, [c_arg] = make_matmul_inputs(interp, func_name, entry)
+        a_arg, b_arg, *_ = interp.arg_names(func_name)
+        A, B = kwargs[a_arg], kwargs[b_arg]
+        outputs = interp.execute_function(func_name, **kwargs)
+        result_C = outputs[c_arg]
 
         expected = (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float16)
         # K=2048 with BLOCK_SIZE_K=128 → 16 accumulation iterations in f16;
