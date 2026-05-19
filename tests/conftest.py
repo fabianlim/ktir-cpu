@@ -216,11 +216,28 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    "indirect_scatter": [
+        {
+            "path": "rfc/indirect-scatter.mlir",
+            # Scatter dual of indirect-access-copy: Y[IDX1[m,k], IDX2[m,k]] = X[m,k].
+            # Requires ktdp.store with IndirectAccessTile.
+            "execute_kwargs": {},
+        },
+    ],
     "paged_tensor_copy_1core": [
         {
             "path": "rfc/paged-tensor-copy.mlir",
             # RFC §C.5 Example 2: paged-attention 4-D indirect gather
             # Requires ktdp.construct_indirect_access_tile.
+            "execute_kwargs": {},
+        },
+    ],
+    "paged_tensor_write_1core": [
+        {
+            "path": "rfc/paged-tensor-write.mlir",
+            # Scatter dual of paged-tensor-copy:
+            # Y[Idx[b, tkv/Ptkv], h, tkv%Ptkv, dkv] = X[b, tkv, h, dkv].
+            # Same LX-overflow constraint as paged-tensor-copy.
             "execute_kwargs": {},
         },
     ],

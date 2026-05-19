@@ -304,6 +304,12 @@ class MemoryOps:
         to those local coordinates via a read-modify-write on the allocation.
         When *coords* is None, stores the full tile (contiguous or strided).
 
+        Source data layout: ``tile.data`` is read in C-order via
+        ``numpy.ndarray.flatten()``, which always returns a contiguous copy.
+        Non-contiguous source arrays are handled internally — callers do not
+        need to pre-``ascontiguousarray`` the tile. When *coords* is supplied,
+        ``coords[i]`` receives the i-th element of ``tile.data`` in C-order.
+
         A single ``mem.read`` + ``mem.write`` covers the entire footprint;
         no per-element dict scans occur.
 
@@ -340,35 +346,59 @@ class MemoryOps:
         Enumerates the variable space, resolves each coordinate tuple
         (direct dims use the variable value, indirect dims look up the
         index in an index memref), then delegates to :meth:`load`.
+
+        Raises NotImplementedError if ``variables_space_order`` is non-identity.
         """
         vss = iat.variables_space_set
         vso = iat.variables_space_order
 
-        # Enumerate all points in the variable space
-        points = vss.enumerate(iat.shape)
-        if vso is not None:
-            points = [vso.eval(pt) for pt in points]
+        if vso is not None and not vso.is_identity():
+            raise NotImplementedError(
+                "indirect_load: output tile permutation via non-identity "
+                "variables_space_order is not yet implemented"
+            )
 
-        # For each point, resolve the actual coordinates in the parent memref
+        # Pre-compile per-dim resolvers so branch dispatch and constant lookups
+        # happen once instead of per enumerated point.
+        resolvers = []
+        for sub in iat.dim_subscripts:
+            kind = sub["kind"]
+            if kind == "direct":
+                resolvers.append(("direct", sub["var_index"]))
+            elif kind == "direct_expr":
+                resolvers.append(("direct_expr", sub["subscript"]))
+            elif kind == "indirect":
+                idx_view = iat.index_views[sub["index_view_idx"]]
+                bpe = _bytes_per_elem(idx_view.dtype)
+                resolvers.append(("indirect", sub["idx_exprs"], idx_view, bpe))
+            else:
+                raise ValueError(f"Unknown indirect subscript kind: {kind}")
+
+        points = vss.enumerate(iat.shape)
+
         coords = []
         for pt in points:
             coord = []
-            for sub in iat.dim_subscripts:
-                if sub["kind"] == "indirect":
-                    # Look up the index from the index memref
-                    idx_view = iat.index_views[sub["index_view_idx"]]
-                    # Compute address into the index tensor
-                    idx_coords = tuple(
-                        eval_subscript_expr(e, pt) for e in sub["idx_exprs"]
-                    )
+            for res in resolvers:
+                tag = res[0]
+                if tag == "direct":
+                    coord.append(pt[res[1]])
+                elif tag == "direct_expr":
+                    coord.append(eval_subscript_expr(res[1], pt))
+                else:  # indirect
+                    _, idx_exprs, idx_view, bpe = res
+                    idx_coords = tuple(eval_subscript_expr(e, pt) for e in idx_exprs)
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
-                    addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
-                    raw = _MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)
-                    coord.append(int(raw[0]))
-                elif sub["kind"] == "direct":
-                    coord.append(pt[sub["var_index"]])
-                elif sub["kind"] == "direct_expr":
-                    coord.append(eval_subscript_expr(sub["subscript"], pt))
+                    addr = idx_view.byte_address + offset * bpe
+                    raw_idx = int(_MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)[0])
+                    # NumPy fancy-index reads silently wrap negative
+                    # indices; reject them here. Use raise so the check
+                    # survives python -O.
+                    if raw_idx < 0:
+                        raise IndexError(
+                            f"indirect index {raw_idx} from {idx_view} is negative"
+                        )
+                    coord.append(raw_idx)
             coords.append(tuple(coord))
 
         out_shape = result_shape if result_shape is not None else iat.shape
@@ -631,3 +661,82 @@ class MemoryOps:
             for ac, off in zip(access_coords, offsets):
                 flat[off] = tile.data[ac]
             mgr.write(flat)
+
+    @staticmethod
+    def indirect_store(
+        context: CoreContext,
+        tile: Tile,
+        iat: "IndirectAccessTile",
+    ) -> None:
+        """Store data using an indirect access tile (scatter pattern).
+
+        Mirror of :meth:`indirect_load`. Enumerates the variable space,
+        resolves each coordinate tuple (direct dims use the variable value,
+        indirect dims look up the index in an index memref), then delegates
+        to :meth:`store`.
+
+        Coordinate collisions (multiple source elements mapping to the same
+        destination coordinate) are *implementation-defined*; the current
+        behavior is last-writer-wins via NumPy fancy-index assignment.
+        """
+        # MLIR type system should already enforce shape match; raise here so a
+        # mismatch surfaces clearly instead of as an opaque NumPy shape error.
+        if tuple(tile.shape) != tuple(iat.shape):
+            raise ValueError(
+                f"indirect_store: source tile shape {tuple(tile.shape)} does not "
+                f"match IAT shape {tuple(iat.shape)}"
+            )
+
+        vss = iat.variables_space_set
+        vso = iat.variables_space_order
+
+        if vso is not None and not vso.is_identity():
+            raise NotImplementedError(
+                "indirect_store: output tile permutation via non-identity "
+                "variables_space_order is not yet implemented"
+            )
+
+        # Pre-compile per-dim resolvers (loop-invariant hoisting): branch
+        # dispatch and constant lookups happen once, not per enumerated point.
+        resolvers = []
+        for sub in iat.dim_subscripts:
+            kind = sub["kind"]
+            if kind == "direct":
+                resolvers.append(("direct", sub["var_index"]))
+            elif kind == "direct_expr":
+                resolvers.append(("direct_expr", sub["subscript"]))
+            elif kind == "indirect":
+                idx_view = iat.index_views[sub["index_view_idx"]]
+                bpe = _bytes_per_elem(idx_view.dtype)
+                resolvers.append(("indirect", sub["idx_exprs"], idx_view, bpe))
+            else:
+                raise ValueError(f"Unknown indirect subscript kind: {kind}")
+
+        points = vss.enumerate(iat.shape)
+
+        coords = []
+        for pt in points:
+            coord = []
+            for res in resolvers:
+                tag = res[0]
+                if tag == "direct":
+                    coord.append(pt[res[1]])
+                elif tag == "direct_expr":
+                    coord.append(eval_subscript_expr(res[1], pt))
+                else:  # indirect
+                    _, idx_exprs, idx_view, bpe = res
+                    idx_coords = tuple(eval_subscript_expr(e, pt) for e in idx_exprs)
+                    offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
+                    addr = idx_view.byte_address + offset * bpe
+                    raw_idx = int(_MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)[0])
+                    # NumPy fancy-index assignment silently wraps negative
+                    # indices; reject them here. Use raise so the check
+                    # survives python -O.
+                    if raw_idx < 0:
+                        raise IndexError(
+                            f"indirect index {raw_idx} from {idx_view} is negative"
+                        )
+                    coord.append(raw_idx)
+            coords.append(tuple(coord))
+
+        MemoryOps.store(context, tile, iat.parent_ref.to_tile_ref(), coords=coords)

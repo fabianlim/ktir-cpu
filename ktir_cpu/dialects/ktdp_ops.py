@@ -32,7 +32,7 @@ from ..ops.comm_ops import CommOps
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
-from ..parser_utils import _extract_bracket_content, parse_attr_block, split_top_level
+from ..parser_utils import _extract_bracket_content, find_ssa_names, parse_attr_block, parse_multi_result_lhs, split_top_level
 from .registry import ParseContext, register, register_parser
 
 
@@ -163,7 +163,8 @@ def ktdp__store(op, context, env):
     assert isinstance(value, Tile), f"ktdp.store expects a Tile, got {type(value)}"
     access_tile = context.get_value(op.operands[1])
     if isinstance(access_tile, IndirectAccessTile):
-        raise NotImplementedError("ktdp.store with IndirectAccessTile is not yet supported")
+        MemoryOps.indirect_store(context, value, access_tile)
+        return None
     if isinstance(access_tile.parent_ref, DistributedTileRef):
         MemoryOps.distributed_store(context, value, access_tile.parent_ref)
         return None
@@ -183,24 +184,45 @@ def ktdp__store(op, context, env):
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
-
-@register_parser("ktdp.get_compute_tile_id")
-def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
-    multi_match = re.match(
-        r'((?:%\w+,\s*)*%\w+)\s*=\s*ktdp\.get_compute_tile_id\s*:\s*(.*)', op_text
-    )
-    if not multi_match:
-        return None
-
-    result_names = [r.strip() for r in multi_match.group(1).split(',')]
-    result = result_names[0] if len(result_names) == 1 else result_names
+# A multi-result op has two MLIR surface forms:
+#   Comma   : "%x, %y = op : index, index"     — referenced as %x, %y
+#   Bundled : "%g:2  = op : index, index"      — referenced as %g#0, %g#1
+#
+# Comma form keeps result names verbatim ("%x", "%y").
+# Bundled form synthesizes "%g#0", "%g#1" so downstream operand lookup
+# finds distinct keys.
+def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
     return Operation(
         result=result,
         op_type="ktdp.get_compute_tile_id",
         operands=[],
         attributes={},
-        result_type="index"
+        result_type="index",
     )
+
+
+@register_parser("ktdp.get_compute_tile_id")
+def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
+    m = re.match(
+        r"^(.*?)\s*=\s*ktdp\.get_compute_tile_id\s*:\s*([^{(]*)\s*$", op_text
+    )
+    if not m:
+        return None
+    names = parse_multi_result_lhs(m.group(1))
+    types_text = m.group(2).strip()
+    if not types_text:
+        raise ValueError("no result types specified")
+    type_list = [t.strip() for t in types_text.split(",")]
+    if any(not t for t in type_list):
+        raise ValueError(f"empty type in list: {types_text!r}")
+    type_count = len(type_list)
+    if len(names) != type_count:
+        raise ValueError(
+            f"ktdp.get_compute_tile_id: {len(names)} result name(s) but "
+            f"{type_count} result type(s) in: {op_text!r}"
+        )
+    result = names[0] if len(names) == 1 else names
+    return _make_compute_tile_id_op(result)
 
 
 @register_parser("ktdp.construct_memory_view")
@@ -416,7 +438,7 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
     result_name = result_match.group(1)
 
     after_eq = op_text[op_text.index('=') + 1:]
-    operands = re.findall(r'%\w+', after_eq)
+    operands = find_ssa_names(after_eq)
 
     tile_match = re.search(r'!ktdp\.access_tile<([^>]+)>', op_text)
     if not tile_match:

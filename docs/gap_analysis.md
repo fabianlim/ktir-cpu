@@ -12,7 +12,7 @@
 | # | Spec Operation | Status | Notes |
 |---|---------------|--------|-------|
 | 1 | `ktdp.construct_distributed_memory_view` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; produces `DistributedMemRef` (composition of N per-partition `MemRef`s). Per-partition routing at access time via `MemoryOps.distributed_tile_access` → `DistributedTileRef`. Tests in `tests/test_distributed_view.py`. |
-| 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. |
+| 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. Both `ktdp.load` (gather, via `MemoryOps.indirect_load`) and `ktdp.store` (scatter, via `MemoryOps.indirect_store`) accept `IndirectAccessTile` (#44 closed). |
 
 ## B. `ktdp` Types & Attributes
 
