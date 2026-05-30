@@ -317,18 +317,25 @@ class BoxSet:
     def try_from_affine_set(cls, aset: "AffineSet") -> Optional["BoxSet"]:
         """Lower an axis-aligned :class:`AffineSet` to a ``BoxSet``.
 
-        Returns ``None`` when the set is not representable as an integer
-        box.  Lowering succeeds iff every constraint has the form
-        ``c * d_i + k >= 0`` with ``c ∈ {+1, -1}`` (single dim, unit coeff)
-        and every axis is pinned on **both** sides (at least one ``+d_i``
-        and one ``-d_i`` constraint).
+        Returns ``None`` when the set cannot be represented as an integer box.
 
-        TODO: symbolic sets (``aset.n_syms > 0``, added by PR #42 for
-        dynamic shapes) are rejected here — they stay on the AffineSet
-        branch.  Lifting this would require BoxSet to carry symbolic
-        bounds and a ``symbols`` argument on contains/enumerate to
-        compose with AffineSet's signature.  ``getattr`` keeps this
-        correct on older AffineSet objects without ``n_syms``.
+        Each constraint must be a single-dim, unit-coefficient expression:
+
+          Inequality  ``±d_i + const >= 0``:
+            +d_i  →  d_i >= -const          →  tightens lo[i]
+            -d_i  →  d_i <=  const          →  tightens hi[i] (exclusive: const+1)
+
+          Equality  ``±d_i + const == 0``:
+            +d_i  →  d_i == -const          →  pins both lo[i] = -const, hi[i] = -const+1
+            -d_i  →  d_i ==  const          →  pins both lo[i] =  const, hi[i] =  const+1
+
+        Multiple constraints on the same axis intersect: lo takes the max,
+        hi takes the min.  Lowering fails if any axis ends up with no lo or
+        no hi bound.
+
+        TODO: symbolic sets (n_syms > 0) are rejected — BoxSet carries only
+        integer bounds.  getattr keeps this correct on older AffineSet objects
+        without n_syms.
         """
         if getattr(aset, "n_syms", 0) != 0:
             return None
@@ -336,25 +343,32 @@ class BoxSet:
         los: List[Optional[int]] = [None] * n
         his: List[Optional[int]] = [None] * n
         for c in aset.constraints:
-            lin = _constraint_to_linear(c, n)
+            # For eq, c[1] is lhs-rhs (already normalised). For ineq, c itself is expr >= 0.
+            expr = c[1] if c[0] == "eq" else c
+            lin = _constraint_to_linear(expr, n)
             if lin is None:
                 return None
             coeffs, const = lin
             nz = [i for i, k in enumerate(coeffs) if k != 0]
             if len(nz) != 1:
                 return None
-            i = nz[0]
-            k = coeffs[i]
-            if k == 1:
-                # d_i + const >= 0  →  d_i >= -const
-                candidate = -const
-                los[i] = candidate if los[i] is None else max(los[i], candidate)
-            elif k == -1:
-                # -d_i + const >= 0  →  d_i <= const  →  hi = const + 1
-                candidate = const + 1
-                his[i] = candidate if his[i] is None else min(his[i], candidate)
-            else:
+            i, k = nz[0], coeffs[nz[0]]
+            if abs(k) != 1:
                 return None
+
+            # Solve for d_i: k*d_i + const == 0  →  d_i = -const/k
+            pinned = -const if k == 1 else const
+
+            if c[0] == "eq":
+                los[i] = pinned     if los[i] is None else max(los[i], pinned)
+                his[i] = pinned + 1 if his[i] is None else min(his[i], pinned + 1)
+            elif k == 1:
+                # d_i >= pinned
+                los[i] = pinned if los[i] is None else max(los[i], pinned)
+            else:
+                # d_i <= pinned  →  hi is exclusive
+                his[i] = pinned + 1 if his[i] is None else min(his[i], pinned + 1)
+
         if any(v is None for v in los) or any(v is None for v in his):
             return None
         return cls(lo=tuple(los), hi=tuple(his))  # type: ignore[arg-type]
