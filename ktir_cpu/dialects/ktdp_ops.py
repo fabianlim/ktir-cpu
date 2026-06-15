@@ -196,8 +196,10 @@ def ktdp__load(op, context, env):
         if cso is not None:
             coords = [cso.eval(pt) for pt in coords]
         result_shape = op.attributes.get("_result_shape", access_tile.shape)
-        return MemoryOps.load(context, access_tile.parent_ref, coords=coords, result_shape=result_shape)
-    return MemoryOps.load(context, access_tile.parent_ref)
+        result = MemoryOps.load(context, access_tile.parent_ref, coords=coords, result_shape=result_shape)
+        return result
+    result = MemoryOps.load(context, access_tile.parent_ref)
+    return result
 
 
 @register("ktdp.store", latency_category=LC.MEMORY)
