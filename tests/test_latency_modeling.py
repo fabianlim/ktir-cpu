@@ -164,20 +164,23 @@ def _run_inline(mlir_text, func_name, cfg=None, seed_lx=False):
 # ---------------------------------------------------------------------------
 
 def _patch_seed_lx(interp):
-    """Mirror every HBM write into each core's LX at the same address.
+    """Mirror every HBM write into each core's LX at the same byte address.
 
     Wraps _prepare_execution so the mirror hook is installed after each fresh
     memory setup. Used when memory views are patched to LX but inputs are
     allocated in HBM by execute_function.
     """
+    from ktir_cpu.memory import HBMSimulator
     orig_prepare = interp._prepare_execution
     def _prepare_and_seed(grid_shape):
         orig_prepare(grid_shape)
         orig_write = interp.memory.hbm.write
-        def _write_and_mirror(ptr, data):
-            orig_write(ptr, data)
+        def _write_and_mirror(stick, data, **kwargs):
+            orig_write(stick, data, **kwargs)
+            intra = kwargs.get("intra_byte", 0)
+            byte_addr = stick * HBMSimulator.STICK_BYTES + intra
             for core in interp.grid_executor.cores:
-                core.lx.write(ptr, data)
+                core.lx.write(byte_addr, data)
         interp.memory.hbm.write = _write_and_mirror
     interp._prepare_execution = _prepare_and_seed
 

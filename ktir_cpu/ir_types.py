@@ -17,7 +17,7 @@ Core IR data types.
 
 Types are ordered by the data-flow pipeline:
 
-- MemRef: Hardware-aware memory view (construct_memory_view result; stick-indexed for HBM)
+- MemRef: Hardware-aware memory view (construct_memory_view result; byte-addressed for both HBM and LX)
 - DistributedMemRef: Distributed analogue of MemRef — list of per-partition MemRefs
   (construct_distributed_memory_view result)
 - TileRef: Byte-addressed sub-tile view (construct_access_tile result; produced from MemRef)
@@ -47,10 +47,9 @@ class MemRef:
     """Hardware-aware memory view (result of construct_memory_view).
 
     Represents a logical view over allocated memory.  ``base_ptr`` is a
-    stick index for HBM or a byte address for LX.  Use ``byte_address``
-    to get the absolute byte position regardless of memory space.
+    byte address for both HBM and LX.
     """
-    base_ptr: int              # stick index (HBM) or byte address (LX)
+    base_ptr: int              # byte address (both HBM and LX)
     shape: Tuple[int, ...]
     strides: List[int]         # element counts
     memory_space: str          # "HBM" or "LX"
@@ -82,34 +81,17 @@ class MemRef:
     @property
     def byte_address(self) -> int:
         """Absolute byte address of this memref's base in its memory space."""
-        if self.memory_space == "HBM":
-            from .memory import HBMSimulator
-            return self.base_ptr * HBMSimulator.STICK_BYTES
         return self.base_ptr
 
     def to_tile_ref(self) -> 'TileRef':
         """Convert to a byte-addressed TileRef for load/store operations."""
         return TileRef(
-            base_ptr=self.byte_address,
+            base_ptr=self.base_ptr,
             shape=self.shape,
             strides=self.strides,
             dtype=self.dtype,
             memref=self,
         )
-
-    def split_addr(self, byte_addr: int) -> Tuple[int, int]:
-        """Split a byte address into a (main, intra) pair for memory reads/writes.
-
-        The meaning of the pair depends on memory space:
-        - HBM: ``(stick_index, intra_byte_offset)``
-        - LX:  ``(byte_addr, 0)`` — LX is byte-addressed with no sub-unit concept.
-
-        New memory spaces add a branch here; callers are unchanged.
-        """
-        if self.memory_space == "HBM":
-            from .memory import HBMSimulator
-            return byte_addr // HBMSimulator.STICK_BYTES, byte_addr % HBMSimulator.STICK_BYTES
-        return byte_addr, 0
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""

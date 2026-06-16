@@ -17,10 +17,10 @@
 module {
   func.func @indirect_scatter() {
         // Stick-indexed addresses (HBM); same layout convention as indirect-access-copy.mlir.
-        %X_addr    = arith.constant 0   : index   // stick 0   = byte 0
-        %IDX1_addr = arith.constant 64  : index   // stick 64  = byte 8192
-        %IDX2_addr = arith.constant 128 : index   // stick 128 = byte 16384
-        %Y_addr    = arith.constant 192 : index   // stick 192 = byte 24576
+        %X_addr    = arith.constant 0     : index  // byte 0
+        %IDX1_addr = arith.constant 8192  : index  // byte 8192 (stick 64)
+        %IDX2_addr = arith.constant 16384 : index  // byte 16384 (stick 128)
+        %Y_addr    = arith.constant 24576 : index  // byte 24576 (stick 192)
 
         // (1) Construct memory view for X (source)
         %X_view = ktdp.construct_memory_view %X_addr, sizes: [64, 64], strides: [64, 1] {

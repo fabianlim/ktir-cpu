@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 
 from ktir_cpu import KTIRInterpreter
+from ktir_cpu.ops.memory_ops import hbm_read, hbm_write
 from conftest import get_test_params
 
 
@@ -41,10 +42,10 @@ from conftest import get_test_params
 # ---------------------------------------------------------------------------
 
 def _write_strided(mem, base_ptr: int, block: np.ndarray, strides: List[int]):
-    """Write *block* (f16) into *mem* at *base_ptr* using *strides* (element units).
+    """Write *block* (f16) into *mem* at *base_ptr* (byte address) using *strides* (element units).
 
-    Element (i, j) lands at byte offset ``(base_ptr + (i*strides[0] + j*strides[1])) * 2``.
-    Holes from non-contiguous layouts are left as zero.
+    Element (i, j) lands at element offset ``(i*strides[0] + j*strides[1])``
+    from the base. Holes from non-contiguous layouts are left as zero.
     """
     assert block.dtype == np.float16
     ndim = block.ndim
@@ -55,7 +56,10 @@ def _write_strided(mem, base_ptr: int, block: np.ndarray, strides: List[int]):
     span = int(offsets.max()) + 1 if offsets.size else 1
     buf = np.zeros(span, dtype=np.float16)
     buf[offsets] = block.flatten()
-    mem.write(base_ptr, buf)
+    if hasattr(mem, 'STICK_BYTES'):
+        hbm_write(mem, base_ptr, buf)
+    else:
+        mem.write(base_ptr, buf)
 
 
 def _get_mem(interp, space: str):
@@ -482,7 +486,7 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
         p1_mem = _get_mem(interp, p1.memory_space)
         _write_strided(p0_mem, p0.base_ptr, p0_block.copy(), p0.strides)
         _write_strided(p1_mem, p1.base_ptr, p1_block.copy(), p1.strides)
-        interp.memory.hbm.write(spec.out_ptr, np.zeros(ac[0] * ac[1], dtype=np.float16))
+        hbm_write(interp.memory.hbm, spec.out_ptr, np.zeros(ac[0] * ac[1], dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function("dist_copy")
@@ -490,7 +494,7 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
     r0, c0 = idx[0], idx[1]
     expected = full[r0:r0 + ac[0], c0:c0 + ac[1]]
     n_out = ac[0] * ac[1]
-    actual = interp.memory.hbm.read(spec.out_ptr, n_out, "f16").reshape(ac)
+    actual = hbm_read(interp.memory.hbm, spec.out_ptr, n_out, "f16").reshape(ac)
     return expected, actual
 
 
@@ -521,7 +525,7 @@ def test_distributed_view_copy_rfc(path, func_name, entry):
         hbm.write(0, full[0:96, :].flatten())
         _write_strided(lx0, 12288, full[96:128, :].copy(), strides=[1, 64])
         lx1.write(16384, full[128:192, :].flatten())
-        hbm.write(24576, np.zeros(192 * 64, dtype=np.float16))
+        hbm_write(hbm, 24576, np.zeros(192 * 64, dtype=np.float16))
         # Advance each LX next_ptr past its seeded region so that _write_to_lx
         # staging (which bumps from next_ptr upward) does not overwrite source data.
         # lx0 seeded at 12288, col-packed span = 31 + 63*64 + 1 = 4064 elems = 8128 bytes
@@ -533,7 +537,7 @@ def test_distributed_view_copy_rfc(path, func_name, entry):
     interp.execute_function(func_name)
 
     expected = np.arange(192 * 64, dtype=np.float16).reshape(192, 64)
-    b = interp.memory.hbm.read(24576, 192 * 64, "f16").reshape(192, 64)
+    b = hbm_read(interp.memory.hbm, 24576, 192 * 64, "f16").reshape(192, 64)
     np.testing.assert_array_equal(b, expected)
 
 
@@ -878,10 +882,10 @@ def test_distributed_store_does_not_trample_outside_C_i():
     bytes_per_part = elems_per_part * bpe
 
     hbm = HBMSimulator(size_gb=1)
-    # Allocate two contiguous partition regions; HBM is stick-addressed
-    # (upstream PR #32) so MemRef.base_ptr is a stick index.
     P0_STICK = hbm.allocate(bytes_per_part)
     P1_STICK = hbm.allocate(bytes_per_part)
+    P0_BYTE = P0_STICK * HBMSimulator.STICK_BYTES
+    P1_BYTE = P1_STICK * HBMSimulator.STICK_BYTES
     SENTINEL = np.float16(-7.0)
 
     hbm.write(P0_STICK, np.full(elems_per_part, SENTINEL, dtype=np.float16))
@@ -894,9 +898,9 @@ def test_distributed_store_does_not_trample_outside_C_i():
     B1 = parse_affine_set("affine_set<(d0, d1) : (d0 - 8 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
     assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
 
-    P0 = MemRef(base_ptr=P0_STICK, shape=PART_SHAPE, strides=[NCOLS, 1],
+    P0 = MemRef(base_ptr=P0_BYTE, shape=PART_SHAPE, strides=[NCOLS, 1],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
-    P1 = MemRef(base_ptr=P1_STICK, shape=PART_SHAPE, strides=[NCOLS, 1],
+    P1 = MemRef(base_ptr=P1_BYTE, shape=PART_SHAPE, strides=[NCOLS, 1],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
     dist = DistributedMemRef(partitions=[P0, P1], shape=(16, 16), dtype=DTYPE)
 
@@ -964,6 +968,8 @@ def test_distributed_store_col_packed_does_not_trample_outside_C_i():
     hbm = HBMSimulator(size_gb=1)
     P0_STICK = hbm.allocate(bytes_per_part)
     P1_STICK = hbm.allocate(bytes_per_part)
+    P0_BYTE = P0_STICK * HBMSimulator.STICK_BYTES
+    P1_BYTE = P1_STICK * HBMSimulator.STICK_BYTES
     SENTINEL = np.float16(99.0)
 
     hbm.write(P0_STICK, np.full(elems_per_part, SENTINEL, dtype=np.float16))
@@ -976,9 +982,9 @@ def test_distributed_store_col_packed_does_not_trample_outside_C_i():
     assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
 
     # strides=[1, NROWS] → column-packed: element (r, c) at offset r + c*NROWS.
-    P0 = MemRef(base_ptr=P0_STICK, shape=PART_SHAPE, strides=[1, NROWS],
+    P0 = MemRef(base_ptr=P0_BYTE, shape=PART_SHAPE, strides=[1, NROWS],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
-    P1 = MemRef(base_ptr=P1_STICK, shape=PART_SHAPE, strides=[1, NROWS],
+    P1 = MemRef(base_ptr=P1_BYTE, shape=PART_SHAPE, strides=[1, NROWS],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
     dist = DistributedMemRef(partitions=[P0, P1], shape=(16, 16), dtype=DTYPE)
 

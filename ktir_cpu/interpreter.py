@@ -25,12 +25,12 @@ import math
 
 from .ir_types import Operation, IRModule, Tile
 from .parser import KTIRParser, KTIRParserBase
-from .memory import SpyreMemoryHierarchy
+from .memory import SpyreMemoryHierarchy, HBMSimulator
 from .grid import GridExecutor, CoreContext
 from .ops.comm_ops import InstantTransferBackend, TransferBackend
 from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
-
+from .ops.memory_ops import hbm_read, hbm_write
 
 from .dtypes import to_ktir_dtype as _ktir_dtype
 
@@ -147,31 +147,33 @@ class KTIRInterpreter:
             if len(kwargs) == len(declared):
                 kwargs = dict(zip(declared, kwargs.values()))
 
-        # Allocate input tensors in HBM
-        input_ptrs = {}
-        input_dtypes = {}
+        # Allocate input tensors in HBM; convert stick index to byte address once.
+        # The kernel SSA env receives byte addresses directly (MemRef.base_ptr contract).
+        input_vars_and_ptrs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
                 stick = self.memory.hbm.allocate(tensor.nbytes)
-                self.memory.hbm.write(stick, tensor)
-                input_ptrs[arg_name] = stick
-                input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
+                byte_addr = stick * HBMSimulator.STICK_BYTES
+                hbm_write(self.memory.hbm, byte_addr, tensor.flatten())
+                input_vars_and_ptrs[arg_name] = byte_addr
             else:
                 # Scalar argument (like n)
-                input_ptrs[arg_name] = tensor
+                input_vars_and_ptrs[arg_name] = tensor
 
         self.grid_executor.execute_with_communication(
-            func.operations, input_ptrs, self._execute_op,
+            func.operations, input_vars_and_ptrs, self._execute_op,
             transfer_backend=self.ring_backend,
         )
 
-        # Read output tensors from HBM
+        # Read output tensors from HBM using the stored byte addresses.
         outputs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                stick = input_ptrs[arg_name]
+                byte_addr = input_vars_and_ptrs[arg_name]
                 n_elements = math.prod(tensor.shape)
-                output_data = self.memory.hbm.read(stick, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
+                output_data = hbm_read(
+                    self.memory.hbm, byte_addr, n_elements, _ktir_dtype(tensor.dtype)
+                ).reshape(tensor.shape)
                 outputs[arg_name] = output_data
 
         return outputs

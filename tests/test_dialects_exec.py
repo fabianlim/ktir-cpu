@@ -1300,14 +1300,15 @@ class TestKtdp:
         # creates a MemRef pointing at the given pointer with the given shape
         hbm = HBMSimulator()
         ptr = hbm.allocate(256 * 2)
+        byte_addr = ptr * HBMSimulator.STICK_BYTES
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
-        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%ptr", byte_addr)
         result = _call("ktdp.construct_memory_view", ctx, _make_env(),
                        operands=["%ptr"],
                        attributes={"shape": (256,), "strides": [1],
                                    "memory_space": "HBM", "dtype": "f16"})
-        assert result.base_ptr == ptr
+        assert result.base_ptr == byte_addr
         assert result.shape == (256,)
 
     def test_construct_memory_view_specializes_symbolic_coord_set_leading_dyn(self):
@@ -1329,7 +1330,7 @@ class TestKtdp:
         ptr = hbm.allocate(256 * 2)
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
-        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%ptr", ptr * HBMSimulator.STICK_BYTES)
         ctx.set_value("%n", 100)
         result = _call(
             "ktdp.construct_memory_view", ctx, _make_env(),
@@ -1410,7 +1411,7 @@ class TestKtdp:
         ptr = hbm.allocate(64 * 100 * 2)
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
-        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%ptr", ptr * HBMSimulator.STICK_BYTES)
         ctx.set_value("%n", 100)
         result = _call(
             "ktdp.construct_memory_view", ctx, _make_env(),
@@ -1441,12 +1442,13 @@ class TestKtdp:
         hbm = HBMSimulator()
         data = np.arange(8, dtype=np.float16)
         ptr = hbm.allocate(data.nbytes)
+        byte_addr = ptr * HBMSimulator.STICK_BYTES
         hbm.write(ptr, data)
 
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
         identity_map = parse_affine_map("affine_map<(d0) -> (d0)>")
-        memref = MemRef(base_ptr=ptr, shape=(8,), strides=[1],
+        memref = MemRef(base_ptr=byte_addr, shape=(8,), strides=[1],
                         memory_space="HBM", dtype="f16")
         tile_ref = memref.to_tile_ref()
         access_tile = AccessTile(parent_ref=tile_ref, shape=(8,),

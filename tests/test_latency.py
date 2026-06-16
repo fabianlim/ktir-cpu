@@ -890,14 +890,14 @@ class TestIndirectAccessLatency:
         }
         _addr_map = {name: constants[name] for name in sizes}
 
-        from ktir_cpu.memory import HBMSimulator
+        from ktir_cpu.ops.memory_ops import hbm_write
         _orig = interp._prepare_execution
         def _prepare_and_seed(grid_shape):
             _orig(grid_shape)
             hbm = interp.memory.hbm
             for name, info in sizes.items():
                 n_elements = int(np.prod(info["shape"]))
-                hbm.write(_addr_map[name],
+                hbm_write(hbm, _addr_map[name],
                           np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
         interp._prepare_execution = _prepare_and_seed
 
@@ -1699,6 +1699,7 @@ class TestIndirectAccessLatency:
         addresses span the full 256 bytes of each view → 2 sticks each.
         """
         from ktir_cpu.ir_types import IndirectAccessTile, MemRef
+        from ktir_cpu.memory import HBMSimulator
         from ktir_cpu.parser_ast import parse_affine_set
 
         x_stick = hbm.allocate(8 * 8 * 2)         # 128 bytes (1 stick)
@@ -1709,11 +1710,11 @@ class TestIndirectAccessLatency:
         hbm.write(idx1_stick, np.zeros(64, dtype=np.int32))
         hbm.write(idx2_stick, np.zeros(64, dtype=np.int32))
 
-        parent = MemRef(base_ptr=x_stick, shape=(8, 8), strides=[8, 1],
+        parent = MemRef(base_ptr=x_stick * HBMSimulator.STICK_BYTES, shape=(8, 8), strides=[8, 1],
                         memory_space="HBM", dtype="f16")
-        idx1 = MemRef(base_ptr=idx1_stick, shape=(8, 8), strides=[8, 1],
+        idx1 = MemRef(base_ptr=idx1_stick * HBMSimulator.STICK_BYTES, shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
-        idx2 = MemRef(base_ptr=idx2_stick, shape=(8, 8), strides=[8, 1],
+        idx2 = MemRef(base_ptr=idx2_stick * HBMSimulator.STICK_BYTES, shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
 
         iat = IndirectAccessTile(
