@@ -19,7 +19,8 @@ Tile view construction, sub-tile access, and HBM/LX load/store
 primitives used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+import itertools
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 import numpy as np
 from ..affine import AffineMap, AffineSet, BoxSet
 from ..dialects.ktdp_helpers import eval_subscript_expr
@@ -180,6 +181,224 @@ def hbm_write(hbm: "HBMSimulator", byte_addr: int, data: np.ndarray) -> None:
     hbm.write(stick, data, intra_byte=intra)
 
 
+def _expr_dependent_vars(expr: tuple) -> Set[int]:
+    """Return the set of iteration-variable indices ``expr`` depends on.
+
+    Walks the same AST tag shapes produced by :func:`eval_subscript_expr`'s
+    parser (``dim``, ``const``, ``ssa``, ``add``, ``sub``, ``mul``, ``neg``,
+    ``floordiv``, ``mod``). ``dim`` nodes contribute their index; ``const``
+    and ``ssa`` contribute nothing; binary/unary ops union their operands'
+    dependent vars. Used by :func:`_block_gather_analyze` to determine which
+    iteration variables an indirect dim's ``idx_exprs`` actually vary over.
+    """
+    tag = expr[0]
+    if tag == "dim":
+        return {expr[1]}
+    if tag in ("const", "ssa"):
+        return set()
+    if tag in ("add", "sub"):
+        return _expr_dependent_vars(expr[1]) | _expr_dependent_vars(expr[2])
+    if tag == "mul":
+        # ("mul", const, expr) — operand order per parser_ast._eval_node.
+        deps: Set[int] = set()
+        for operand in (expr[1], expr[2]):
+            if isinstance(operand, tuple):
+                deps |= _expr_dependent_vars(operand)
+        return deps
+    if tag == "neg":
+        return _expr_dependent_vars(expr[1])
+    if tag in ("floordiv", "mod"):
+        # ("floordiv"/"mod", expr, const) — only the first operand is an AST node.
+        return _expr_dependent_vars(expr[1])
+    raise ValueError(f"_expr_dependent_vars: unknown expr tag: {tag}")
+
+
+def _block_gather_analyze(
+    iat: "IndirectAccessTile",
+) -> Optional[Tuple[Set[int], List[int], List[int], List[int], bool]]:
+    """Gate + analyze an IAT for the block-gather fast path.
+
+    Requires >=1 indirect dim and >=1 direct/direct_expr dim, and
+    ``variables_space_set`` must be a concrete :class:`BoxSet` (the
+    fast path needs per-axis [lo, hi) extents to compute point counts).
+
+    ``dep_vars`` is the union, over every indirect dim's ``idx_exprs``, of
+    the iteration variables those expressions actually depend on (via
+    :func:`_expr_dependent_vars`). ``unique_lookups`` is the product of
+    those dependent variables' extents; ``total_points`` is the product of
+    every variable's extent. The fast path only pays off when
+    ``unique_lookups`` is much smaller than ``total_points`` — gated here
+    at a 16x ratio.
+
+    Returns ``None`` when the IAT doesn't qualify, otherwise
+    ``(dep_vars, dep_var_list, dep_extents, dep_los, use_fallback_offsets)``:
+
+    * ``dep_var_list``: sorted list of the vars in ``dep_vars`` (stable
+      iteration order for the broadcast/enumeration helpers).
+    * ``dep_extents`` / ``dep_los``: per-dep-var ``(hi - lo)`` extent and
+      ``lo`` offset, aligned with ``dep_var_list``.
+    * ``use_fallback_offsets``: True when a ``direct_expr`` dim is present
+      or ``variables_space_order`` is non-identity — cases where the
+      vectorized broadcast path doesn't apply and the fast path delegates
+      wholesale to the general path's functions instead.
+    """
+    vss = iat.variables_space_set
+    if not isinstance(vss, BoxSet) or not vss.is_concrete:
+        return None
+
+    indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
+    other_subs = [s for s in iat.dim_subscripts if s.get("kind") != "indirect"]
+    if not indirect_subs or not other_subs:
+        return None
+
+    dep_vars: Set[int] = set()
+    for sub in indirect_subs:
+        for expr in sub["idx_exprs"]:
+            dep_vars |= _expr_dependent_vars(expr)
+
+    dep_var_list = sorted(dep_vars)
+    dep_extents = [vss.hi[d] - vss.lo[d] for d in dep_var_list]
+    dep_los = [vss.lo[d] for d in dep_var_list]
+
+    unique_lookups = 1
+    for e in dep_extents:
+        unique_lookups *= e
+
+    total_points = 1
+    for lo, hi in zip(vss.lo, vss.hi):
+        total_points *= (hi - lo)
+
+    if unique_lookups * 16 > total_points:
+        return None
+
+    has_direct_expr = any(s.get("kind") == "direct_expr" for s in iat.dim_subscripts)
+    vso = iat.variables_space_order
+    non_identity_vso = vso is not None and not vso.is_identity()
+    use_fallback_offsets = has_direct_expr or non_identity_vso
+
+    return dep_vars, dep_var_list, dep_extents, dep_los, use_fallback_offsets
+
+
+def _is_block_gather(iat: "IndirectAccessTile") -> bool:
+    """True iff ``iat`` qualifies for the block-gather fast path."""
+    return _block_gather_analyze(iat) is not None
+
+
+def _enumerate_dep_points(
+    iat: "IndirectAccessTile", dep_var_list: List[int],
+) -> List[Tuple[int, ...]]:
+    """Enumerate the (small) dependent-variable point set.
+
+    ``itertools.product`` over ``[vss.lo[d], vss.hi[d])`` for each
+    ``d in dep_var_list``. Returns ``[()]`` (single empty tuple) when
+    ``dep_var_list`` is empty — matches ``itertools.product()`` semantics,
+    so a fully-constant indirect index still resolves exactly once.
+    """
+    vss = iat.variables_space_set
+    ranges = [range(vss.lo[d], vss.hi[d]) for d in dep_var_list]
+    return list(itertools.product(*ranges))
+
+
+def _block_gather_broadcast_coords(
+    iat: "IndirectAccessTile",
+    idx_values: Dict[int, np.ndarray],
+    dep_var_list: List[int],
+    dep_extents: List[int],
+    dep_los: List[int],
+    use_fallback: bool,
+) -> np.ndarray:
+    """Build the ``(total_points, ndim)`` parent-tensor coordinate array via
+    numpy broadcasting, from the small ``dep_points``-sized ``idx_values``.
+
+    Non-fallback (identity VSO, no ``direct_expr`` dims) case: every
+    dim_subscript contributes a per-dim coordinate array broadcastable
+    against every *other* iteration variable's extent:
+
+    * ``indirect`` dims: the resolved ``idx_values`` array (shaped along
+      the dependent variables' axes) reshaped/broadcast to align with
+      ``dep_var_list``'s axis positions, then broadcast against the
+      independent (non-dependent) direct dims' extents.
+    * ``direct`` dims: ``np.arange(extent)`` over the dim's own variable,
+      reshaped to its own axis and broadcast against every other axis.
+
+    All per-dim arrays share one broadcast shape — the full iteration
+    space's shape, ordered by variable index (0..n_vars-1) — and are
+    stacked along a new last axis, then reshaped to ``(total_points, ndim)``.
+
+    The fallback case delegates wholesale to the general path: this
+    function is not called for ``use_fallback=True`` inputs (callers route
+    through ``_resolve_idx_reads``/``_build_indirect_coords`` with the full
+    point set instead — see ``indirect_load``/``indirect_store``).
+    """
+    if use_fallback:
+        raise AssertionError(
+            "_block_gather_broadcast_coords: fallback case must delegate to "
+            "_build_indirect_coords directly, not call this function"
+        )
+
+    vss = iat.variables_space_set
+    n_vars = len(vss.lo)
+    var_extents = [vss.hi[d] - vss.lo[d] for d in range(n_vars)]
+
+    # Axis position of each iteration variable in the shared broadcast shape.
+    axis_of_var = {d: i for i, d in enumerate(range(n_vars))}
+
+    def _broadcast_shape_for(var_indices: List[int], arr_shape_by_var: Dict[int, int]) -> Tuple[int, ...]:
+        shape = [1] * n_vars
+        for d in var_indices:
+            shape[axis_of_var[d]] = arr_shape_by_var[d]
+        return tuple(shape)
+
+    per_dim_arrays: List[np.ndarray] = []
+    for sub in iat.dim_subscripts:
+        kind = sub["kind"]
+        if kind == "direct":
+            d = sub["var_index"]
+            extent = var_extents[d]
+            arr = (np.arange(extent, dtype=np.int64) + vss.lo[d]).reshape(
+                _broadcast_shape_for([d], {d: extent})
+            )
+        elif kind == "indirect":
+            iv_idx = sub["index_view_idx"]
+            values = idx_values.get(iv_idx)
+            if values is None or values.size == 0:
+                # Zero-extent enumeration (e.g. a dependent var has extent
+                # 0): the placeholder must carry that zero extent on the
+                # dependent vars' axes so broadcasting collapses the whole
+                # coordinate array to zero rows, matching the general
+                # path's behavior on an empty variable space.
+                empty_shape = [1] * n_vars
+                for i, d in enumerate(dep_var_list):
+                    empty_shape[axis_of_var[d]] = dep_extents[i]
+                per_dim_arrays.append(np.zeros(tuple(empty_shape), dtype=np.int64))
+                continue
+            # values was resolved over the full dep_points product (every
+            # dep var, itertools.product row-major order) regardless of
+            # which subset of dep vars this particular indirect dim's
+            # idx_exprs actually reference — _resolve_idx_reads is shared
+            # across all indirect_subs and enumerates dep_points once for
+            # all of them. Reshape to the full dep-var-extents shape, then
+            # place each of those axes onto its own variable's position in
+            # the shared n_vars broadcast shape (singleton elsewhere).
+            dep_shape = tuple(dep_extents) if dep_extents else (1,)
+            values = values.reshape(dep_shape)
+            shape = [1] * n_vars
+            for i, d in enumerate(dep_var_list):
+                shape[axis_of_var[d]] = dep_extents[i]
+            arr = values.reshape(tuple(shape))
+        else:
+            raise ValueError(
+                f"_block_gather_broadcast_coords: unexpected kind {kind!r} "
+                f"in non-fallback path"
+            )
+        per_dim_arrays.append(arr)
+
+    broadcasted = np.broadcast_arrays(*per_dim_arrays)
+    ndim = len(iat.dim_subscripts)
+    coords = np.stack(broadcasted, axis=-1).reshape(-1, ndim)
+    return coords
+
+
 def _enumerate_in_vso_order(iat: "IndirectAccessTile") -> List[Tuple[int, ...]]:
     """Enumerate variable-space points in ``variables_space_order``-permuted order.
 
@@ -201,8 +420,15 @@ def _enumerate_in_vso_order(iat: "IndirectAccessTile") -> List[Tuple[int, ...]]:
 
 def _resolve_idx_reads(
     context: CoreContext, iat: "IndirectAccessTile",
+    points: Optional[List[Tuple[int, ...]]] = None,
 ) -> Tuple[Dict[int, np.ndarray], int]:
     """Read every idx-tensor value the IAT enumeration needs.
+
+    ``points`` overrides the enumerated point set. Defaults to
+    ``_enumerate_in_vso_order(iat)`` (the full iteration space). The
+    block-gather fast path passes the smaller dependent-variable point
+    set here — everything else in this function is unchanged; a smaller
+    ``points`` list is simply a smaller loop.
 
     For each indirect dimension, enumerates its address in pt order, then
     issues one ``_MemAccessor.read_scattered`` per index view (so all
@@ -227,7 +453,7 @@ def _resolve_idx_reads(
     ``indirect_store`` both call it so their stick accounting stays in
     sync (guard symmetry).
     """
-    points = _enumerate_in_vso_order(iat)
+    points = points if points is not None else _enumerate_in_vso_order(iat)
     indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
 
     # Hoist per-view loop-invariants once before enumerating points.
@@ -274,6 +500,23 @@ def _resolve_idx_reads(
     return per_view_values, total_sticks
 
 
+def _validate_nonneg_idx(idx_values: Dict[int, np.ndarray], index_views) -> None:
+    """Raise IndexError if any resolved indirect-index value is negative.
+
+    NumPy fancy-indexing silently wraps negative indices — this is the one
+    place both the scalar (:func:`_build_indirect_coords`) and vectorized
+    (block-gather) coordinate paths must call before using a resolved value
+    as an offset component.
+    """
+    for iv_idx, arr in idx_values.items():
+        neg = arr < 0
+        if neg.any():
+            raw_idx = int(arr[neg][0])
+            raise IndexError(
+                f"indirect index {raw_idx} from {index_views[iv_idx]} is negative"
+            )
+
+
 def _build_indirect_coords(
     iat: "IndirectAccessTile", idx_values: Dict[int, np.ndarray],
 ) -> List[Tuple[int, ...]]:
@@ -289,12 +532,14 @@ def _build_indirect_coords(
       same pt-major, dim-minor order).
 
     Raises ``IndexError`` on a negative idx value — NumPy fancy-indexing
-    silently wraps negatives, so we reject them here.  The check survives
-    ``python -O`` (uses ``raise``, not ``assert``).
+    silently wraps negatives, so we reject them here via a single
+    vectorized check up front (see :func:`_validate_nonneg_idx`) rather
+    than a per-point scalar comparison in the hot loop.
 
     Shared by ``indirect_load`` and ``indirect_store`` so their coord
     construction stays in lockstep (guard symmetry).
     """
+    _validate_nonneg_idx(idx_values, iat.index_views)
     points = _enumerate_in_vso_order(iat)
     idx_iters = {iv_idx: iter(values) for iv_idx, values in idx_values.items()}
 
@@ -309,13 +554,7 @@ def _build_indirect_coords(
                 coord.append(eval_subscript_expr(sub["subscript"], pt))
             elif kind == "indirect":
                 iv_idx = sub["index_view_idx"]
-                raw_idx = int(next(idx_iters[iv_idx]))
-                if raw_idx < 0:
-                    raise IndexError(
-                        f"indirect index {raw_idx} from "
-                        f"{iat.index_views[iv_idx]} is negative"
-                    )
-                coord.append(raw_idx)
+                coord.append(int(next(idx_iters[iv_idx])))
             else:
                 raise ValueError(f"Unknown indirect subscript kind: {kind}")
         coords.append(tuple(coord))
@@ -643,21 +882,43 @@ class MemoryOps:
                 f"dimensions; got non-permutation map: {vso.source}"
             )
 
-        # Resolve every idx-tensor read up front: one accessor per index
-        # view, one read_scattered call, sticks deduped inside the accessor.
-        # Both helpers route their pt enumeration through
-        # _enumerate_in_vso_order, so non-identity vso permutes the
-        # iteration order consistently across idx reads and coord build
-        # (RFC 0682 §473).
-        idx_values, idx_unique_sticks = _resolve_idx_reads(context, iat)
-        coords = _build_indirect_coords(iat, idx_values)
+        # Block-gather fast path: when the indirect index lookup depends on
+        # only a small subset of the iteration variables, resolve idx reads
+        # over just that (small) dependent-variable point set and broadcast
+        # coordinates out to the full shape via numpy — instead of resolving
+        # + building coords over every point in the full iteration space.
+        # Both branches terminate at the same MemoryOps.load(coords=...)
+        # call; the fast path never talks to the simulators directly.
+        info = _block_gather_analyze(iat)
+        if info is not None:
+            dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
+            if use_fallback:
+                idx_values, idx_sticks = _resolve_idx_reads(context, iat)
+                coords = _build_indirect_coords(iat, idx_values)
+            else:
+                dep_points = _enumerate_dep_points(iat, dep_var_list)
+                idx_values, idx_sticks = _resolve_idx_reads(context, iat, points=dep_points)
+                _validate_nonneg_idx(idx_values, iat.index_views)
+                coords = _block_gather_broadcast_coords(
+                    iat, idx_values, dep_var_list, dep_extents, dep_los,
+                    use_fallback=False,
+                )
+        else:
+            # Resolve every idx-tensor read up front: one accessor per index
+            # view, one read_scattered call, sticks deduped inside the
+            # accessor. Both helpers route their pt enumeration through
+            # _enumerate_in_vso_order, so non-identity vso permutes the
+            # iteration order consistently across idx reads and coord build
+            # (RFC 0682 §473).
+            idx_values, idx_sticks = _resolve_idx_reads(context, iat)
+            coords = _build_indirect_coords(iat, idx_values)
 
         out_shape = result_shape if result_shape is not None else iat.shape
         result = MemoryOps.load(
             context, iat.parent_ref.to_tile_ref(),
             coords=coords, result_shape=out_shape,
         )
-        result.index_unique_sticks = idx_unique_sticks
+        result.index_unique_sticks = idx_sticks
         return result
 
     # ------------------------------------------------------------------
@@ -994,14 +1255,70 @@ class MemoryOps:
                 f"dimensions; got non-permutation map: {vso.source}"
             )
 
-        # Resolve idx reads (returns idx_unique_sticks: int, 0 for all-LX
-        # views) and delegate the data write to MemoryOps.store (returns
-        # int: HBM stick count, 0 for LX).  Both helpers enumerate via
-        # _enumerate_in_vso_order so non-identity vso permutes the
-        # iteration order consistently with indirect_load (RFC 0682 §473).
-        idx_values, idx_unique_sticks = _resolve_idx_reads(context, iat)
-        coords = _build_indirect_coords(iat, idx_values)
+        # Block-gather fast path — mirror of indirect_load's dispatch (see
+        # comment there); both branches terminate at MemoryOps.store.
+        info = _block_gather_analyze(iat)
+        if info is not None:
+            dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
+            if use_fallback:
+                idx_values, idx_sticks = _resolve_idx_reads(context, iat)
+                coords = _build_indirect_coords(iat, idx_values)
+            else:
+                dep_points = _enumerate_dep_points(iat, dep_var_list)
+                idx_values, idx_sticks = _resolve_idx_reads(context, iat, points=dep_points)
+                _validate_nonneg_idx(idx_values, iat.index_views)
+                coords = _block_gather_broadcast_coords(
+                    iat, idx_values, dep_var_list, dep_extents, dep_los,
+                    use_fallback=False,
+                )
+        else:
+            # Resolve idx reads (returns idx_unique_sticks: int, 0 for all-LX
+            # views) and delegate the data write to MemoryOps.store (returns
+            # int: HBM stick count, 0 for LX).  Both helpers enumerate via
+            # _enumerate_in_vso_order so non-identity vso permutes the
+            # iteration order consistently with indirect_load (RFC 0682 §473).
+            idx_values, idx_sticks = _resolve_idx_reads(context, iat)
+            coords = _build_indirect_coords(iat, idx_values)
+
         data_sticks = MemoryOps.store(
             context, tile, iat.parent_ref.to_tile_ref(), coords=coords,
         )
-        return data_sticks + idx_unique_sticks
+        return data_sticks + idx_sticks
+
+
+# ---------------------------------------------------------------------------
+# Block-gather fast-path entry points
+#
+# Thin wrappers kept for test/API compatibility with the direct-call shape
+# tests exercise (`_block_gather_load`/`_block_gather_store`). Both simply
+# delegate to MemoryOps.indirect_load/indirect_store, which already contain
+# the fast-path dispatch (see the `_block_gather_analyze` branch in each).
+# There is no separate fast-path implementation to keep in sync — this is
+# the whole point of the reuse design (see DESIGN_block_gather_stub.md).
+# ---------------------------------------------------------------------------
+
+def _block_gather_load(
+    context: CoreContext,
+    iat: "IndirectAccessTile",
+    result_shape: Optional[Tuple[int, ...]] = None,
+) -> Tile:
+    """Block-gather-specific entry point; delegates to ``MemoryOps.indirect_load``.
+
+    Callers should generally prefer ``MemoryOps.indirect_load`` directly —
+    it already dispatches to the fast path internally via
+    ``_block_gather_analyze``. This wrapper exists for tests that want to
+    name the fast path explicitly.
+    """
+    return MemoryOps.indirect_load(context, iat, result_shape=result_shape)
+
+
+def _block_gather_store(
+    context: CoreContext,
+    tile: Tile,
+    iat: "IndirectAccessTile",
+) -> int:
+    """Block-gather-specific entry point; delegates to ``MemoryOps.indirect_store``.
+
+    See :func:`_block_gather_load` — same rationale.
+    """
+    return MemoryOps.indirect_store(context, tile, iat)
